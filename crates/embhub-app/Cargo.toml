@@ -1,0 +1,15 @@
+[package]
+name = "embhub-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "embhub 桌面外壳（Tauri v2）——只是 core 的薄适配层"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+embhub-core = { path = "../embhub-core" }

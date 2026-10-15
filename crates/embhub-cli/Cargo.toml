@@ -1,0 +1,13 @@
+[package]
+name = "embhub-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "embhub-cli"
+path = "src/main.rs"
+
+[dependencies]
+embhub-core = { path = "../embhub-core" }
+serde_json.workspace = true

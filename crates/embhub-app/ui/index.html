@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>embhub — Phase 0 spike</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: "Cascadia Mono", Consolas, monospace;
+      margin: 0; padding: 16px; background: #14161a; color: #d7dae0;
+    }
+    h1 { font-size: 15px; font-weight: 600; margin: 0 0 12px; color: #8ab4f8; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+    button {
+      background: #2a2f3a; color: #d7dae0; border: 1px solid #3c4350;
+      padding: 6px 12px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 13px;
+    }
+    button:hover { background: #353b48; }
+    select, input {
+      background: #1c2027; color: #d7dae0; border: 1px solid #3c4350;
+      padding: 6px; border-radius: 4px; font: inherit; font-size: 13px;
+    }
+    input { width: 80px; }
+    #log {
+      background: #0e1014; border: 1px solid #2a2f3a; border-radius: 4px;
+      padding: 10px; height: 380px; overflow: auto; font-size: 12.5px;
+      line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+    }
+    .ok { color: #7ee787; }
+    .err { color: #ff7b72; }
+    .dim { color: #6e7681; }
+    .hex { color: #e3b341; }
+  </style>
+</head>
+
+<body>
+  <h1>embhub — Phase 0 spike（列串口 / 开串口 / 收数据）</h1>
+
+  <div class="row">
+    <button id="refresh">刷新端口</button>
+    <select id="port"></select>
+    <label>波特率 <input id="baud" value="115200" /></label>
+    <label>读取秒数 <input id="secs" value="3" /></label>
+    <button id="read">打开并读取</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    const invoke = window.__TAURI__.core.invoke;
+    const logEl = document.getElementById("log");
+    const portEl = document.getElementById("port");
+
+    function log(msg, cls) {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      line.textContent = `[${t}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function refresh() {
+      try {
+        const ports = await invoke("list_ports");
+        portEl.innerHTML = "";
+        if (ports.length === 0) {
+          log("未发现任何串口", "err");
+          return;
+        }
+        for (const p of ports) {
+          const opt = document.createElement("option");
+          opt.value = p.port_name;
+          const extra = p.vid != null
+            ? ` VID:PID=${p.vid.toString(16).padStart(4, "0").toUpperCase()}:${p.pid.toString(16).padStart(4, "0").toUpperCase()}`
+            : "";
+          opt.textContent = `${p.port_name} [${p.port_type}]${extra}`;
+          portEl.appendChild(opt);
+        }
+        log(`发现 ${ports.length} 个串口：${ports.map(p => p.port_name).join(", ")}`, "ok");
+      } catch (e) {
+        log(`枚举失败：${e}`, "err");
+      }
+    }
+
+    async function read() {
+      const port = portEl.value;
+      if (!port) { log("请先刷新并选择端口", "err"); return; }
+      const baud = parseInt(document.getElementById("baud").value, 10) || 115200;
+      const secs = parseInt(document.getElementById("secs").value, 10) || 3;
+      log(`打开 ${port} @ ${baud}，读取 ${secs}s …`, "dim");
+      try {
+        const r = await invoke("read_probe", { port, baud, seconds: secs });
+        if (r.bytes === 0) {
+          log(`收到 0 字节 —— 端口已打开但这段窗口内没有数据`, "err");
+        } else {
+          log(`收到 ${r.bytes} 字节`, "ok");
+          log(`HEX: ${r.hex}`, "hex");
+        }
+      } catch (e) {
+        log(`读取失败：${e}`, "err");
+      }
+    }
+
+    document.getElementById("refresh").addEventListener("click", refresh);
+    document.getElementById("read").addEventListener("click", read);
+    refresh();
+  </script>
+</body>
+
+</html>

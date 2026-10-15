@@ -1,0 +1,14 @@
+# Rust 工具链与构建产物（home 落在工作区内，见 docs/PLAN.md 5.4）
+/.rustup/
+/.cargo/
+/rustup-init.exe
+/target/
+**/target/
+
+# 探针与临时
+/probe-tmp/
+/.tmp/
+
+# 前端
+node_modules/
+/app/dist/assets/
