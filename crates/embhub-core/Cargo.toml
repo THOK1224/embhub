@@ -7,6 +7,6 @@ license.workspace = true
 [dependencies]
 serialport.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
+# 已在 Cargo.lock 中（此前是 dev-dependency）：用于会话头里的指纹段序列化。
+# SPEC 3.3 要求会话头带上指纹，指纹字段多且要能无损读回，JSON 段比手写二进制更不容易写错。
 serde_json.workspace = true

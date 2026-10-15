@@ -2,6 +2,34 @@
 //!
 //! 铁律：本 crate 的依赖里**不允许出现 tauri**（见 docs/PLAN.md 4.1）。
 //! 这样 core 能被 `cargo test` 独立验证，也能被 `embhub-cli` 无头调用。
+//!
+//! 模块契约见 docs/SPEC.md 第 3 节：
+//! - [`source`]：SPEC 3.1 `ByteSource`（seam 之一）。
+//! - [`store`]：SPEC 3.3 `LogStore`（seam 之二，全项目 depth 最高）。
+//! - [`pipeline`]：PLAN 4.3 流式管线（落盘无损 + 有界显示队列背压）。
+//! - [`fingerprint`]：SPEC 3.5 `FirmwareFingerprint`（日志绑固件版本）。
+//! - [`crc`] / [`sha256`]：CRC32 与 SHA-256，纯软件实现，无第三方依赖。
+
+#![forbid(unsafe_code)]
+
+pub mod crc;
+pub mod fingerprint;
+pub mod pipeline;
+pub mod sha256;
+pub mod source;
+pub mod store;
+
+pub use fingerprint::{Field as FingerprintField, FirmwareFingerprint};
+pub use pipeline::{
+    DisplayBatch, Pipeline, PipelineConfig, PipelineStats, StopReason, DEFAULT_BATCH_BYTES,
+    DEFAULT_BATCH_TIMEOUT_MS, DEFAULT_DISPLAY_CAPACITY,
+};
+pub use source::{Block, ByteSource, MonoMicros, SourceError, SyntheticConfig, SyntheticSource};
+pub use store::{
+    read_session_header, Chunk, FingerprintSection, LogStore, ReplaySource, SessionHeader,
+    SessionId, SessionMeta, SessionStats, StoreError, FINGERPRINT_NOT_COLLECTED, FORMAT_VERSION,
+    HEADER_MAGIC, RECORD_HEADER_LEN, V1_FINGERPRINT_PLACEHOLDER_LEN,
+};
 
 use serde::Serialize;
 

@@ -276,11 +276,30 @@ CARGO_HOME  = <workspace>\.cargo
 | 6 | WebView2 就位 | ✅ 完成 | 155.0.4283.45（注册表 + 安装目录双确认） |
 | 7 | **Tauri app 编译通过** | ✅ **完成** | `cargo build -p embhub-app` exit 0（34.52 s，无需提权）；tauri 2.12.4 / wry 0.57.0 / tao 0.37.1。首次失败是缺 `icons/icon.ico`，已用 `scripts/make_icon.py` 生成 |
 | 8 | `cargo test` 全绿 | ✅ **完成** | `cargo test -p embhub-core -p embhub-cli` → 2 passed，0 failed |
-| 9 | **spike 窗口 + 插拔刷新 + 收到真实数据** | ⬜ **未通过（环境受限）** | 窗口在沙箱内启动时 WebView2 报 `HRESULT(0x8000FFFF) 灾难性故障`；需在沙箱外启动验证 |
+| 9 | **spike 窗口** | ✅ **通过** | 用户在沙箱外 `cargo run -p embhub-app` 目视确认：窗口正常、枚举出 10 个串口、「刷新端口」可用 |
+| 9b | 插拔后列表刷新 / 115200 收到真实数据 | ⏸ **用户主动延后** | 手头无 USB 设备；用户后续自验，**通过则进入 Phase 1，有问题则按第 6 节切换判据回 Python 路线** |
 | 10 | 写 SPEC.md | ✅ **已完成（提前）** | [`docs/SPEC.md`](SPEC.md)：契约部分与技术栈无关，不依赖 spike 结果 |
 | 11 | 静态检查基线（`rustfmt` / `clippy`） | ✅ 完成 | 组件已装；`cargo fmt --all --check` exit 0，`cargo clippy --all-targets -- -D warnings` exit 0 |
 
-**当前唯一阻塞**：**GUI 窗口无法在 DSH 沙箱内启动。**
+### 9.1 Phase 1 增量 A：零丢失闭环（✅ 已验收，2026-10-15）
+
+| 项 | 状态 | captain 实测证据 |
+| --- | --- | --- |
+| `ByteSource` 接口 + Serial/Synthetic 两实现 | ✅ | `source.rs`；`SourceError` 区分无数据与致命断开；块带单调到达时间 |
+| `LogStore` 写入/回放 + 会话头 + 分片 + CRC32 | ✅ | `store.rs`；`EMBHLOG\0` / 版本 1 / 指纹占位；`open_replay` 逐字节一致 |
+| `cli selftest`（无硬件证明零丢失） | ✅ | `--bytes 67108864` → 注入 == 落盘 == 回放 == 67108864，exit 0 |
+| 测试基线 | ✅ | `cargo test`：core **24 passed** + cli **8 passed** |
+| 静态检查 | ✅ | clippy `-D warnings` 与 fmt `--check` 均 exit 0 |
+| 零新增依赖 / core 无 tauri | ✅ | `Cargo.lock` 未改动；测试 `core_has_no_tauri_dependency` 通过 |
+| 不破坏 Phase 0 能力 | ✅ | `list` 列出 10 个串口；`build -p embhub-app` exit 0 |
+
+**已记录的残留缺口**：`selftest` 未做端到端故障注入，「运行时计数对不上 → 非零退出」只有 `verdict()` 单测覆盖（captain 判定可接受：为恒真单行映射在生产代码加钩子，设计上更差）。
+
+**实现者变更记录**：原定 `kimi-k3`，因项目限速 `并发数1 / RPM 3` 累计 6 次 attempt 均 429，经用户决定改用 `deepseek-official` 完成（详见 [`LOG.md`](../LOG.md) 第 4、5 轮）。
+
+---
+
+**Phase 0 遗留阻塞（已解除）**：GUI 窗口无法在 DSH 沙箱内启动——该问题已由用户在沙箱外启动验证通过。
 
 - 已排除配置原因：数据目录已显式指向工作区内（`EBWebView` 成功生成 115 项），`--no-sandbox --disable-gpu` 也无效；
 - 现象：WebView2 子进程（`msedgewebview2.exe`）被拉起，但 controller 创建失败；
@@ -292,7 +311,7 @@ CARGO_HOME  = <workspace>\.cargo
 **用户在普通终端执行**（无沙箱，不会遇到上述限制）：
 
 ```powershell
-.\scripts\env.ps1                      # 或 pwsh -ExecutionPolicy Bypass -File .\scripts\env.ps1
+. .\scripts\env.ps1                     # 必须点源；被执行策略拦时先 Set-ExecutionPolicy -Scope Process Bypass
 cargo test -p embhub-core -p embhub-cli
 cargo run -p embhub-app
 ```

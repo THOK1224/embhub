@@ -3,10 +3,14 @@
 面向嵌入式开发的桌面集成工具：把**串口调试**、**SSH/SFTP**、**Git** 放进同一条工作流，
 并把每份日志与**当时运行的固件指纹**（commit + dirty + bin hash）绑定起来。
 
-> **当前状态：Phase 0（spike），差最后一步。**
-> ✅ 已通过：Rust 工具链、MSVC 链接、`serialport` 编译、10 个真实串口枚举、`cargo test` 全绿（2 passed）、**Tauri v2 编译通过**、WebView2 就位。
-> ⬜ **未通过：窗口能否打开**——沙箱内启动时 WebView2 报 `HRESULT(0x8000FFFF) 灾难性故障`（判断为沙箱限制，非配置问题）；插拔刷新与收数据因此尚未验证。
-> **下一步：在普通终端里 `cargo run -p embhub-app`**，验收两件事（见 [`docs/PLAN.md`](docs/PLAN.md) 第 9 节与 [`LOG.md`](LOG.md) 第 3 轮）。
+> **当前状态：Phase 0 已通过；Phase 1 增量 A、B1、B2、C1 已验收。**
+> ✅ **Phase 0 全部通过**：Rust 工具链、MSVC 链接、Tauri v2 编译、WebView2 就位、窗口正常打开、**插拔串口后列表能刷新**、**115200 下能收到板子发来的真实数据**。
+> ✅ 增量 A：`ByteSource` + `LogStore` + `cli selftest`（零丢失闭环）。证据见 [`LOG.md`](LOG.md) 第 5 轮。
+> ✅ 增量 B1：`fingerprint` 固件指纹采集 + 自实现 SHA-256（bin_hash 与 Windows `Get-FileHash` 交叉校验一致）。证据见 [`LOG.md`](LOG.md) 第 7 轮。
+> ✅ 增量 B2：指纹写进会话头，**日志格式升到 v2**，`selftest --repo` 端到端从磁盘读回比对；captain 另做了不经 Rust 的字节级校验（头长 558 = 24+486+4+44）。证据见 [`LOG.md`](LOG.md) 第 8 轮。
+> ✅ 增量 C1：**流式管线与背压**（SPEC 4.3）。captain 用两项独立验证确认「显示可丢、落盘不可丢」：把显示队列容量设为 **0**（显示 100% 丢弃）时落盘仍零丢失；并用**纯 PowerShell 直接解析磁盘分片**数出 payload 536,870,912 == 源产出，**差 = 0**。证据见 [`LOG.md`](LOG.md) 第 9 轮。
+> ⬜ 下一步：增量 C2（把 GUI 接到这条管线上）。
+> 全项目测试基线：**core 50 passed + cli 17 passed**；`clippy -D warnings` 与 `fmt --check` 干净。
 
 ---
 
@@ -68,8 +72,9 @@ embhub/
 ### 设置环境（每个新终端都要做一次）
 
 ```powershell
-.\scripts\env.ps1
-# 若被执行策略拦：pwsh -ExecutionPolicy Bypass -File .\scripts\env.ps1
+. .\scripts\env.ps1
+# 必须点源（前面的点）。若被执行策略拦：先 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+# 不要用 pwsh -File：那是子进程，环境变量不会留在你的终端
 ```
 
 这个脚本把 `RUSTUP_HOME` / `CARGO_HOME` / `TMP` / `TEMP` **全部指向工作区内**。
@@ -94,12 +99,60 @@ cargo run -p embhub-app                      # 启动 spike 窗口
 
 ## 主要能力
 
-### 已实现（spike 级，会重构）
+### 已实现
+
+**Phase 0 spike（会重构）**
 
 - `embhub-core::list_ports()` —— 跨平台串口枚举（端口名、类型、USB VID/PID/序列号/产品名）。
 - `embhub-core::read_port()` —— 打开端口、按波特率读取、返回**字节数**与 HEX 预览。
-- `embhub-cli` —— `list` / `read` 两个子命令。
 - `embhub-app` —— Tauri 窗口：刷新端口、选择端口与波特率、打开读取并显示结果。
+
+**Phase 1 增量 B1：固件指纹采集（已验收）**
+
+- `embhub-core::fingerprint` —— SPEC 3.5 的 `FirmwareFingerprint`：`repo_root` / `commit`（强制 40 位 hex）/ `dirty`（`git status --porcelain` 非空）/ `bin_path` / `bin_hash`（**内容**哈希）/ `build_time` / `chip` / `probe_id`。
+  取不到的字段用 `Field<T> { Value(T), Missing(String) }` 表示——**「看着有指纹、其实是空的」在类型上不成立**。
+- `embhub-core::sha256` —— 自实现的流式 SHA-256（纯 std，**零新增第三方依赖**），与 Windows `Get-FileHash` 在真实文件上逐字符一致。
+- `embhub-cli fingerprint --repo <dir> [--bin <file>]` —— 打印全部字段，缺失字段打印原因并汇总清单；采集失败仍以 0 退出（**不是命令失败**），仅缺 `--repo` 时以 1 退出。
+
+**Phase 1 增量 C1：流式管线与背压（已验收）**
+
+- `embhub-core::pipeline` —— 常驻读取线程：**到达点时间戳原样搬运** → **先 append 落盘**（失败即致命并记账）→ 显示旁路按「≥8 KiB 或 ≥30 ms 先到先发」攒批，`try_send` 投入**有界**的 `sync_channel`，满即丢批次并计 `batches_dropped` / `display_bytes_dropped`。
+- `stop()` 幂等（join + seal），`stats()` 停后仍可读；`wait_until_finished(timeout)`（Condvar）区分「等自然结束」与「现在就停」。
+- `embhub-cli stream --bytes N [--chunk K] [--consume fast|slow|stalled] [--display-capacity C]` —— **退出码只看落盘零丢失**，显示丢弃不影响退出码。
+
+  ```
+  # 显示队列容量设 0（显示 100% 丢弃）——落盘依然零丢失
+  .\scripts\cargo.cmd run --quiet -p embhub-cli -- stream --bytes 67108864 --consume stalled --display-capacity 0
+  → batches_emitted 0 / display_bytes_dropped 67108864
+    logged == replay == source == 67108864        exit 0
+  ```
+
+**Phase 1 增量 B2：指纹写进会话头（日志格式 v2，已验收）**
+
+- `LogStore` 会话头升到 **v2**：`magic[8] | version | start_wall_ms | fp_len | fp_json | cfg_len | cfg`。指纹用**长度前缀的 JSON 段**存储，取代 v1 的 32 字节固定占位——后者根本装不下 `commit`(40) + `bin_hash`(64)。
+- `FingerprintSection { collected, not_collected }`：不变量「**恰好一个有值**」在写入与读取两端都校验，**未采集必须带原因**。
+- **v1 被明确拒绝**并提示「已废弃，需 v2」，绝不按 v2 误解析；未知的未来版本单独分支处理。
+- `embhub-cli selftest --repo <dir> [--bin <file>]`：采集 → 写进 v2 头 → 落盘 seal → **从磁盘读回** → 逐字段比对，不一致非零退出。
+
+  ```
+  .\scripts\cargo.cmd run --quiet -p embhub-cli -- selftest --bytes 1000000 --repo . --bin docs\SPEC.md
+  → 版本=2；✓ 指纹逐字段比对：会话头读回 == 采集值（8/8 字段）
+  ```
+
+**Phase 1 增量 A：零丢失闭环（已验收）**
+
+- `embhub-core::source` —— `ByteSource` 接口（SPEC 3.1）+ `SerialSource` 与 `SyntheticSource` 两个实现；`SourceError` 区分「暂时无数据」与「致命断开」；块自带单调到达时间。
+- `embhub-core::store` —— `LogStore`（SPEC 3.3）：会话头（`EMBHLOG\0` + 版本 + 时间 + 来源配置 + **指纹段**；A 阶段为 v1 的 32 字节占位，B2 起为 v2）、分片 append-only、每条记录带 CRC32、`seal`、`open_replay` 精确回放。
+- `embhub-core::crc` —— 自实现的 CRC32（**零新增第三方依赖**）。
+- `embhub-cli selftest [--bytes N] [--seed S]` —— 不依赖硬件就能证明「注入 == 落盘 == 回放读回」：
+
+  ```
+  .\scripts\cargo.cmd run --quiet -p embhub-cli -- selftest --bytes 67108864
+  → 注入 67108864 == 落盘 67108864 == 回放读回 67108864，逐字节比对一致
+  ```
+
+- 测试基线（增量 A 交付时）：core **24 passed** + cli **8 passed**；`clippy -D warnings` 与 `fmt --check` 干净。
+- **全项目当前基线（含 B1）：core 35 passed + cli 10 passed。**
 
 ### 规划中（见 PLAN）
 
@@ -126,6 +179,7 @@ cargo run -p embhub-app                      # 启动 spike 窗口
 
 | 文件 | 作用 |
 | --- | --- |
+| [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | **验收清单**：15 条自动项 + 3 条人工项的原始命令、期望输出、通过标准，以及"什么情况下应推翻我的结论" |
 | [`docs/SPEC.md`](docs/SPEC.md) | **应该成为什么**：设计原则、五个模块契约、边界、可执行验收标准 |
 | [`docs/PLAN.md`](docs/PLAN.md) | 实施计划 v0.3：范围、差异化、架构、八阶段、风险清单 |
 | [`docs/DECISION-2026-10-14-stack-tauri-v2.md`](docs/DECISION-2026-10-14-stack-tauri-v2.md) | 技术栈决策（为什么是 Tauri v2）与 spike 判据 |

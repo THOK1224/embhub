@@ -1,13 +1,33 @@
-# embhub 开发环境（用法：. .\scripts\env.ps1）
+# embhub dev environment
 #
-# 为什么需要这个脚本（全部是实测结论，见 docs/PLAN.md 5.4 与 LOG.md 第 2 轮）：
-#   1. 当前 DSH 沙箱是 workspace-write，工作区外写入被拒。
-#      因此 RUSTUP_HOME / CARGO_HOME 都必须落在工作区内。
-#   2. link.exe 用系统 TMP（工作区外）建临时文件会 LNK1104，必须把 TMP/TEMP 也指进工作区。
-#   3. 首次下载依赖需要 TLS 凭据，沙箱下 schannel 会失败，需提权一次；
-#      依赖进了工作区内的 CARGO_HOME 之后，日常 cargo build 不再需要提权。
+# Usage (MUST be dot-sourced in the CURRENT shell, so the variables survive):
+#     . .\scripts\env.ps1
+# If the execution policy blocks it, relax it for this process only (no system change):
+#     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+#     . .\scripts\env.ps1
+#
+# Do NOT use `pwsh -File .\scripts\env.ps1`: that runs in a child process and the
+# variables are lost when it exits.
+#
+# This file is intentionally ASCII-only: a .ps1 without a BOM is decoded as ANSI by
+# Windows PowerShell 5.1, which corrupts non-ASCII comments and can break parsing.
+# Rationale and measurements live in docs/PLAN.md 5.4 and LOG.md (rounds 2 and 3).
+#
+# Why these variables are needed:
+#   1. The DSH sandbox is workspace-write, so writes outside the workspace are denied.
+#      RUSTUP_HOME / CARGO_HOME must therefore live inside the workspace.
+#   2. link.exe writes temp files to the system TMP (outside the workspace) and fails
+#      with LNK1104, so TMP/TEMP must point inside the workspace too.
+#   3. The first dependency download needs TLS credentials, which fail under the
+#      sandbox (schannel SEC_E_NO_CREDENTIALS); that one step needs escalation or a
+#      plain terminal. Once the registry cache is populated, builds need no network.
 
-$ws = Split-Path -Parent $PSScriptRoot
+# Works both when dot-sourced ($PSScriptRoot is set) and when piped through iex.
+if ($PSScriptRoot) {
+    $ws = Split-Path -Parent $PSScriptRoot
+} else {
+    $ws = (Get-Location).Path
+}
 
 $env:RUSTUP_HOME = Join-Path $ws '.rustup'
 $env:CARGO_HOME = Join-Path $ws '.cargo'

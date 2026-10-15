@@ -12,3 +12,9 @@
 # 前端
 node_modules/
 /app/dist/assets/
+
+# AgentTeams 本地运行时状态（不属于项目源码）
+/.agent-teams/
+
+# 构建残留（例如被占用产物改名后的 .locked-*）
+*.locked-*
