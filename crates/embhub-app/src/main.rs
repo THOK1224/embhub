@@ -28,8 +28,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State, WebviewUrl, WebviewWindowBuilder};
 
 use embhub_core::{
-    describe_serial, DataBits, DisplayBatch, FlowControl, LogStore, Parity, PipelineConfig,
-    SerialConfig, SerialFrame, SerialSource, Session, SessionMeta, SessionSnapshot, StopBits,
+    describe_serial, DataBits, DisplayBatch, FingerprintSection, FlowControl, LogStore, Parity,
+    PipelineConfig, SerialConfig, SerialFrame, SerialSource, Session, SessionList, SessionMeta,
+    SessionSnapshot, StopBits,
 };
 
 /// 串口读超时：兼顾「停止要及时」与「不忙等」（超时算「暂时无数据」，不是错误）。
@@ -153,6 +154,51 @@ struct OpenSessionConfig {
     stop_bits: String,
     /// `"none" | "rtscts" | "xonxoff"`
     flow_control: String,
+    /// 仓库路径（**选填**）：填了才采集固件指纹；空串/缺省 = 本会话不含指纹。
+    #[serde(default)]
+    repo_path: String,
+    /// 构建产物路径（**选填**）：只在采集指纹且给了它时才会有 `bin_hash`。
+    #[serde(default)]
+    bin_path: String,
+}
+
+/// 文本框 → `Option<PathBuf>`：**去首尾空白后为空就是「没填」**。
+fn optional_trimmed(raw: &str) -> Option<PathBuf> {
+    let t = raw.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(t))
+    }
+}
+
+/// 采集输入：`(repo, bin)`，两者都可为 `None`。
+fn fingerprint_inputs(cfg: &OpenSessionConfig) -> (Option<PathBuf>, Option<PathBuf>) {
+    (
+        optional_trimmed(&cfg.repo_path),
+        optional_trimmed(&cfg.bin_path),
+    )
+}
+
+/// 构造会话元数据——**「不得静默产生无指纹日志」的落点**。
+///
+/// 两种情况写进 v2 会话头的指纹段是不同的：
+/// · 填了 `repoPath` → 调 core 的 `fingerprint::collect` 采集（字段取不到时**带原因**）；
+/// · 没填 `repoPath` → 走 [`SessionMeta::new`]，core 会写「未采集 + 原因」。
+/// 界面上这两种必须都能看出来（参数区提示 + 状态行明示），见 `ui/index.html`。
+///
+/// 另外修掉一个真实缺陷：baud 与帧格式之间原来没有分隔符，
+/// 来源配置会粘成 `serial:COM14@1152008N1`（t19 的列举把它暴露了出来）。
+fn build_session_meta(cfg: &OpenSessionConfig, port: &str, frame: &SerialFrame) -> SessionMeta {
+    let source_config = format!("serial:{port}@{} {}", cfg.baud, frame.summary());
+    let (repo, bin) = fingerprint_inputs(cfg);
+    match repo {
+        Some(repo) => {
+            let fp = embhub_core::fingerprint::collect(&repo, bin.as_deref());
+            SessionMeta::with_fingerprint(source_config, fp)
+        }
+        None => SessionMeta::new(source_config),
+    }
 }
 
 /// 把控件字符串解析成 core 的枚举。不认识就报错并列出可接受取值（不猜、不静默降级）。
@@ -449,6 +495,12 @@ struct SessionOpened {
     session_dir: String,
     start_wall_ms: u64,
     start_mono_micros: u64,
+    /// 本会话**实际写进会话头**的指纹段：就是 core 的 `FingerprintSection`
+    /// （键名 `collected`/`not_collected`，与磁盘头、CLI 的 `sessions --json` 一致）。
+    /// 已采集时含 commit/dirty/bin_hash 等字段；未采集时含**原因**。
+    fingerprint: FingerprintSection,
+    /// 指纹摘要来自哪里；会话头回读失败时说明原因（界面会显式告警）。
+    fingerprint_note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -484,7 +536,97 @@ struct TimedSendStopped {
 }
 
 // ---------------------------------------------------------------------------
-// 4 个 Tauri command
+// 日志列表（G1 的 core 列举能力 → 界面友好的 DTO）
+// ---------------------------------------------------------------------------
+
+/// 列表里的一项会话。
+///
+/// 用 snake_case 字段名与其它 DTO 保持一致（前端读的是 `row.start_wall_ms`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionRow {
+    id: String,
+    dir: String,
+    /// 起始墙上时间（Unix epoch 毫秒）；头坏了就是 null。
+    start_wall_ms: Option<u64>,
+    source_config: Option<String>,
+    payload_bytes: u64,
+    records: u64,
+    segments: u64,
+    /// 坏会话的原因（null = 完全可读）。
+    problem: Option<String>,
+    /// 指纹段：已采集 / 未采集（带原因）/ 头不可读（null）。
+    /// 直接用 core 的类型，键名与磁盘头一致（**不另造形状**）。
+    fingerprint: Option<FingerprintSection>,
+}
+
+/// 根目录下被跳过的条目。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SkippedRow {
+    name: String,
+    reason: String,
+}
+
+/// `list_sessions` 命令的返回：**一个坏会话不会让别的会话消失**（core 已保证）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SessionListDto {
+    root: String,
+    root_problem: Option<String>,
+    sessions: Vec<SessionRow>,
+    skipped: Vec<SkippedRow>,
+    /// 界面显示「没有会话」的直接依据（不许前端自己猜）。
+    is_empty: bool,
+    ok_count: usize,
+    broken_count: usize,
+}
+
+/// 会话列表：core 的 [`SessionList`] → 界面 DTO（丢掉「未采集原因」是绝对不行的）。
+fn session_list_dto(list: SessionList) -> SessionListDto {
+    // 先把派生计数取出来，下面会把它拆开搬走字段。
+    let is_empty = list.is_empty();
+    let ok_count = list.ok_count();
+    let broken_count = list.broken_count();
+    SessionListDto {
+        root: list.root.display().to_string(),
+        root_problem: list.root_problem,
+        sessions: list
+            .sessions
+            .into_iter()
+            .map(|s| SessionRow {
+                id: s.id,
+                dir: s.dir.display().to_string(),
+                start_wall_ms: s.start_wall_ms,
+                source_config: s.source_config,
+                payload_bytes: s.payload_bytes,
+                records: s.records,
+                segments: s.segments,
+                problem: s.problem,
+                fingerprint: s.fingerprint,
+            })
+            .collect(),
+        skipped: list
+            .skipped
+            .into_iter()
+            .map(|s| SkippedRow {
+                name: s.name,
+                reason: s.reason,
+            })
+            .collect(),
+        is_empty,
+        ok_count,
+        broken_count,
+    }
+}
+
+/// 界面填的 sessions 目录：去掉首尾空白后为空 → 用程序数据目录下的 `sessions`。
+fn sessions_root_for(input: Option<&str>) -> PathBuf {
+    match input.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => PathBuf::from(p),
+        None => resolve_data_dir().join("sessions"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tauri command
 // ---------------------------------------------------------------------------
 
 /// 打开会话：源 + 落盘 + 发送句柄 + 事件泵。配置以**一个对象**传入（便于继续扩字段）。
@@ -542,10 +684,11 @@ fn open_session(
         .map_err(|e| format!("取发送句柄失败（端口可能已被占用）: {e}"))?;
 
     let frame_summary = frame.summary();
-    let meta = SessionMeta::new(format!("serial:{port}@{}{}", config.baud, frame.summary()));
+    // 指纹在这里采集（填了 repoPath 才采）并交给 core 写进 v2 会话头。
+    let meta = build_session_meta(&config, &port, &frame);
     let session = Arc::new(Session::new(
         store,
-        meta,
+        meta.clone(),
         Box::new(source),
         Some(Box::new(sink)),
         PipelineConfig::default(),
@@ -596,6 +739,15 @@ fn open_session(
         describe_serial(&cfg, &frame),
         session_dir.display()
     );
+    // 指纹摘要以**磁盘上的会话头**为准（core 在 create_session 里写进去的）：
+    // 这样界面显示的是「日志里真的有什么」，而不是「我打算写什么」。
+    let (fingerprint, fingerprint_note) = match embhub_core::read_session_header(&session_dir) {
+        Ok(header) => (header.fingerprint, None),
+        Err(e) => (
+            meta.fingerprint.clone(),
+            Some(format!("会话头回读失败（以下是写入值，未必已落盘）: {e}")),
+        ),
+    };
     let opened = SessionOpened {
         port: port.clone(),
         baud: config.baud,
@@ -604,6 +756,8 @@ fn open_session(
         session_dir: session_dir.display().to_string(),
         start_wall_ms: start.wall_ms,
         start_mono_micros: start.mono_micros,
+        fingerprint,
+        fingerprint_note,
     };
     *state
         .inner
@@ -840,6 +994,15 @@ fn list_ports() -> Result<Vec<embhub_core::PortInfo>, String> {
     embhub_core::list_ports()
 }
 
+/// 列举历史会话（G1 的 core 能力）；`root` 为空 → 用程序数据目录下的 `sessions`。
+///
+/// **只读**：只读会话头与分片记录头，不碰任何仓库，也不执行任何 git 写操作。
+#[tauri::command]
+fn list_sessions(root: Option<String>) -> Result<SessionListDto, String> {
+    let root = sessions_root_for(root.as_deref());
+    Ok(session_list_dto(embhub_core::list_sessions(&root)))
+}
+
 /// 应用的私有数据目录（WebView2 缓存、会话日志都放这里）。
 ///
 /// 为什么不用 Tauri 默认的 `app_local_data_dir()`（即 `%LOCALAPPDATA%\<identifier>`）：
@@ -871,7 +1034,8 @@ fn main() {
             session_stats,
             send_data,
             start_timed_send,
-            stop_timed_send
+            stop_timed_send,
+            list_sessions
         ])
         .setup(|app| {
             let data_dir = resolve_data_dir();
@@ -1028,8 +1192,496 @@ mod tests {
 
     // ---- 布局：防止「接收区把下方区域挤出去 / 压扁重叠」回归 -----------------
 
-    /// 删掉 CSS 注释（`/* ... */`）——注释里会出现 `{`、`}`、`;` 之类字符，
-    /// 不先删掉，按规则切分就会把注释误当成选择器。
+    /// **布局闸门（H1a 起重写，沿用同一个测试名）**。
+    ///
+    /// 旧版钉的是「一列 flex + 固定区永不收缩」那套 CSS 规则；布局换成
+    /// **区域对象 + 分割树 + CSS Grid 显式轨道** 之后，旧规则已经不存在了，
+    /// 所以这里**重新推导**成新模型的不变量（不是删掉、也不是放宽）：
+    ///
+    /// ① 区域表只有一份（在 `ui/layout.js`），四个区域齐备，且**每区最小尺寸都大于 0**
+    ///    —— 最小值为 0 就等于允许被压没，那正是 t17 重叠的成因；
+    /// ② 每个区域容器**强制裁剪**（overflow: hidden）+ `min-width/min-height: 0`，
+    ///    确保尺寸不随内容变化、内容永不画到区域盒子之外；
+    /// ③ 布局根是 `#app` 且是显式 Grid 轨道（轨道由求解结果写 px，不是绝对定位）；
+    /// ④ 求解器**被页面引用而非复制**（页面里不许再出现区域表/求解函数）；
+    /// ⑤ harness 入口存在（URL 参数），且**五项不变量断言都在**（防止只剩报告）；
+    /// ⑥ 持久化走 `normalizeState`（坏数据回退），且 Node 侧有零依赖测试；
+    /// ⑦ 内容只能经区域 API 写（`regions.get(...)`），四个区域的内容源与区域表一一对应。
+    #[test]
+    fn layout_invariants_prevent_the_receive_pane_from_squeezing_others() {
+        let layout = include_str!("../ui/layout.js");
+        let html = include_str!("../ui/index.html");
+        let layout_test = include_str!("../ui/layout.test.js");
+
+        // ---- ① 区域表：四区齐备 + 每区最小尺寸 > 0 ----
+        for id in ["params", "tx", "rx", "events"] {
+            let block = region_block(layout, id);
+            assert!(
+                block.contains(&format!("id: \"{id}\"")),
+                "区域 {id} 的 def 里必须带上 id"
+            );
+            for key in ["minW", "minH"] {
+                let v = number_after(block, key);
+                assert!(
+                    v > 0,
+                    "区域 {id} 的 {key} 必须 > 0；最小值为 0 = 允许被压没 = 会重叠"
+                );
+            }
+            assert!(
+                block.contains("weight:")
+                    && block.contains("closable:")
+                    && block.contains("defaultVisible:"),
+                "区域 {id} 必须声明 weight / closable / defaultVisible"
+            );
+        }
+        assert!(
+            !layout.contains("minW: 0") && !layout.contains("minH: 0"),
+            "任何区域都不允许 0 最小尺寸"
+        );
+
+        // ---- ② 区域容器：强制裁剪 + 尺寸不随内容变化 ----
+        let region_css = css_block(html, ".region {");
+        assert!(
+            region_css.contains("overflow: hidden"),
+            "区域容器必须强制裁剪自己的内容（overflow: hidden），否则内容会画到区域之外：{region_css}"
+        );
+        assert!(
+            region_css.contains("min-width: 0") && region_css.contains("min-height: 0"),
+            "区域容器必须有 min-width/min-height: 0，才不会被内容顶大：{region_css}"
+        );
+        let body_css = css_block(html, ".region > .region-body {");
+        assert!(
+            body_css.contains("overflow: auto"),
+            "区域内部滚动容器必须 overflow: auto：{body_css}"
+        );
+        assert!(
+            html.contains("region.el.hidden = !state.visible[id]"),
+            "可见性必须直接作用在区域元素上"
+        );
+
+        // ---- ③ 布局根是 #app，且轨道是显式 Grid（不是绝对定位） ----
+        assert!(html.contains("<div id=\"app\"></div>"), "布局根必须是 #app");
+        let app_css = css_block(html, "#app {");
+        assert!(
+            app_css.contains("display: grid"),
+            "#app 必须是 Grid 容器：{app_css}"
+        );
+        assert!(
+            app_css.contains("min-width:") && app_css.contains("min-height:"),
+            "#app 必须有最小尺寸（JS 覆盖为可见区域最小值之和）：{app_css}"
+        );
+        assert!(
+            html.contains("gridTemplateColumns") && html.contains("gridTemplateRows"),
+            "轨道必须由求解结果写成显式 Grid 轨道"
+        );
+        assert!(
+            !html.contains("position: absolute"),
+            "区域不许用绝对定位摆位置（要用 Grid 轨道）"
+        );
+
+        // ---- ④ 求解器被页面引用，而不是复制 ----
+        assert!(
+            html.contains("<script src=\"layout.js\"></script>"),
+            "页面必须引用 layout.js"
+        );
+        assert!(
+            html.contains("window.embhubLayout") && html.contains("solve({"),
+            "页面必须调用 layout.js 的 solve"
+        );
+        assert!(
+            !html.contains("minW:") && !html.contains("minH:"),
+            "页面不许复制区域表；区域表只能在 ui/layout.js 里有一份"
+        );
+        assert!(
+            !html.contains("function solve(") && !html.contains("function subtreeMin("),
+            "页面不许复制求解器实现"
+        );
+
+        // ---- ⑤ harness：URL 入口 + 五项不变量断言都在 ----
+        assert!(
+            html.contains("URLSearchParams") && html.contains("selftest"),
+            "harness 入口必须是页面 URL 参数（index.html?selftest=1）"
+        );
+        for rule in [
+            "overlap",
+            "box-grown",
+            "control-covered",
+            "below-min",
+            "h-scroll",
+        ] {
+            assert!(
+                html.contains(rule),
+                "harness 缺少不变量断言 `{rule}`（不许只剩一份好看的报告）"
+            );
+        }
+        assert!(
+            html.contains("const saved = {") && html.contains("appEl.style.width = saved.width"),
+            "harness 必须先存后还，**只测量不改布局**"
+        );
+        assert!(
+            html.contains("elementFromPoint"),
+            "控件遮挡检查必须用 elementFromPoint 实测"
+        );
+
+        // ---- ⑥ 持久化 + 坏数据回退 + Node 侧零依赖测试 ----
+        assert!(
+            html.contains("localStorage") && html.contains("STORAGE_KEY"),
+            "可见性与比例必须写进 localStorage"
+        );
+        assert!(
+            html.contains("normalizeState"),
+            "读回的状态必须过 normalizeState（坏数据回退）"
+        );
+        assert!(
+            layout.contains("function normalizeState")
+                && layout.contains("function serializeState"),
+            "状态规整/序列化必须在 layout.js 里（浏览器与 Node 共用同一套）"
+        );
+        for coverage in ["最小值", "塌缩", "坏数据", "clamp"] {
+            assert!(
+                layout_test.contains(coverage),
+                "Node 测试必须覆盖 `{coverage}`（这是 captain 能独立复跑的那一半）"
+            );
+        }
+        assert!(
+            layout_test.contains("require(\"./layout.js\")"),
+            "Node 测试必须直接 require 求解器（不另写一份逻辑）"
+        );
+
+        // ---- ⑦ 内容只经区域 API 写；区域表与 DOM 一一对应 ----
+        assert!(
+            html.contains("function createRegion(def)") && html.contains("regions.get("),
+            "区域容器必须由注册表创建，内容必须经 regions.get(id) 写入"
+        );
+        for id in ["params", "tx", "rx", "events"] {
+            assert!(
+                html.contains(&format!("data-region=\"{id}\"")),
+                "区域 {id} 的内容源必须存在（区域表与 DOM 一一对应）"
+            );
+        }
+
+        // ---- ⑧ 区域交互（t24）：开关/重开入口、分隔条、拖拽、双击复位、守卫 ----
+        // 关闭按钮由区域表驱动（不是硬编码一组按钮）
+        assert!(
+            html.contains("if (def.closable) {"),
+            "区域的关闭按钮必须由区域表的 closable 字段驱动"
+        );
+        // 「重新打开」的全局入口：四个区域全部由 REGION_ORDER 生成，并带可被真实事件驱动的标识
+        assert!(
+            html.contains("function syncRegionToggles()")
+                && html.contains("for (const id of REGION_ORDER)"),
+            "「区域」入口必须由区域表（REGION_ORDER）驱动"
+        );
+        assert!(
+            html.contains("box.dataset.regionToggle = id"),
+            "区域入口的开关必须带 data-region-toggle（harness 用它驱动「重新打开」）"
+        );
+        assert!(
+            html.contains("box.disabled = !def.closable"),
+            "常驻区域的开关必须禁用（不可关）"
+        );
+        // 不允许把最后一个可见区域关掉：必须走 layout.js 的纯函数守卫，并把原因说出来
+        assert!(
+            html.contains("L.canHide(state.visible, id, REGIONS)"),
+            "关闭前必须过 canHide 守卫（最后一个可见区域不许关）"
+        );
+        assert!(
+            html.contains("不能关闭「") && html.contains("verdict.reason"),
+            "被拒绝时必须把原因显示出来（不得静默失败）"
+        );
+        // 分隔条按「可见孩子数 - 1」生成，带容器/下标标识
+        assert!(
+            html.contains("function rebuildSplitters(node)") && html.contains("kids.length - 1"),
+            "分隔条必须按容器的可见孩子数生成（n-1 条），不许硬编码"
+        );
+        assert!(
+            html.contains("sp.dataset.splitNode = node.id")
+                && html.contains("sp.dataset.splitIndex = String(index)"),
+            "分隔条必须带容器与下标标识（拖拽据此还原相邻的一对）"
+        );
+        assert!(
+            html.contains("function makeSplitter(node, index)")
+                && html.contains("L.visibleChildren(node, state.visible, REGIONS)"),
+            "分隔条必须由可见孩子列表驱动"
+        );
+        // 拖拽：纯函数算新尺寸（等量反向 + 双侧最小值 clamp），真实事件驱动，结束即持久化
+        assert!(
+            html.contains("L.resizePair(") && html.contains("splitNodeId: dragging.nodeId"),
+            "拖拽必须调用 layout.js 的 resizePair（不许在页面里自己算）"
+        );
+        assert!(
+            html.contains("window.addEventListener(DRAG.move, onDragMove)")
+                && html.contains("window.addEventListener(DRAG.up, endDrag)"),
+            "拖拽必须用真实事件处理函数（pointer/mouse 二选一）"
+        );
+        assert!(
+            html.contains("saveState(); // 每次交互后持久化"),
+            "拖拽结束后必须持久化"
+        );
+        assert!(
+            html.contains("addEventListener(\"dblclick\"")
+                && html.contains("function resetContainer(nodeId)"),
+            "双击分隔条必须能恢复默认比例"
+        );
+        // harness 覆盖交互路径：真实事件驱动 + 复用同一套不变量断言
+        assert!(
+            html.contains("function interactionPlan()")
+                && html.contains("function dragSplitter(nodeId, index, delta)"),
+            "harness 必须通过真实事件驱动交互（拖拽/双击/点击关闭/勾选重开）"
+        );
+        for need in [
+            "dblclickSplitter",
+            "clickCloseButton",
+            "toggleRegionFromGlobalEntry",
+            "setVisible(\"params\", false)",
+        ] {
+            assert!(
+                html.contains(need),
+                "harness 的交互计划里缺少 `{need}`（拖到极限 / 关闭再重开 / 常驻区域拒绝 / 双击复位）"
+            );
+        }
+        assert!(
+            html.contains("pair-isolation"),
+            "harness 必须断言「拖拽只影响相邻两个区域」（pair-isolation）"
+        );
+        assert!(
+            html.contains("const problems = verdict.problems.concat(extra)"),
+            "交互后的每个状态必须复用同一套不变量断言"
+        );
+
+        // ---- ⑨ F1 根因：隐藏项必须在**布局上**不占位（G15 实测抓到的真缺陷）----
+        // 陷阱：UA 的 `[hidden] { display: none }` 特异性 (0,1,0)，而 `.region { display: flex }`
+        // 也是 (0,1,0) —— 特异性相同时作者样式优先，于是 `el.hidden = true` 只隐藏语义、
+        // 布局上仍是 grid item：求解器删了轨道、DOM 还占位 ⇒ 轨道与孩子错位一位。
+        // 所以必须有一条**盖得住 `.region` 的** `[hidden]` 规则。
+        let css = html
+            .split_once("<style>")
+            .and_then(|(_, rest)| rest.split_once("</style>"))
+            .map(|(css, _)| css)
+            .expect("index.html 必须有 <style> 块");
+        let base = css_specificity(".region");
+        let winner = hidden_display_none_rule(css);
+        let (sel, spec, important) = winner.clone().unwrap_or_else(|| {
+            panic!("CSS 里必须有一条针对 [hidden] 的 display:none 规则（F1 修复）")
+        });
+        assert!(
+            important || spec > base,
+            "`{sel}` 的特异性 {spec:?} 必须高于 `.region` 的 {base:?}（或用 !important），\
+             否则 [hidden] 盖不住 `.region {{ display: flex }}`，隐藏区域仍会占一个 grid 轨道位"
+        );
+        // 再钉一次「不许用 !important 之外的取巧」：这条规则得真的把 display 设成 none
+        assert!(
+            css.contains("[hidden]") && css.contains("display: none"),
+            "缺少 [hidden] 的 display:none 规则"
+        );
+
+        // ---- ⑩ harness：错位的机器判据 + 对视口鲁棒的跳过机制 ----
+        assert!(
+            html.contains("track-item-mismatch"),
+            "harness 必须有「轨道数 ≠ 可见 grid item 数」这条精确规则（F1 的机器判据）"
+        );
+        assert!(
+            html.contains(
+                "const expected = track.sizes.length > 0 ? track.sizes.length * 2 - 1 : 0"
+            ),
+            "轨道数必须按「孩子轨道 + 间隙轨道」的交错布局算出期望值（2n-1）"
+        );
+        assert!(
+            html.contains("getComputedStyle(c).display !== \"none\""),
+            "可见 grid item 数必须按**实际 display** 统计（hidden 若没被真正隐藏就会被数进来）"
+        );
+        assert!(
+            html.contains("skipped.push({") && html.contains("skippedChecks"),
+            "harness 必须把「本视口下无法成立」的检查标成跳过并汇总上报（不得静默略过）"
+        );
+        assert!(
+            html.contains("viewport") && html.contains("真实视口"),
+            "报告必须打印真实视口尺寸与跳过原因"
+        );
+        // 反作弊：**只有视口相关的检查**允许出现在 skipped 里；既有规则一条都不许被「跳过」洗白
+        let skipped_blocks = collect_blocks(html, "skipped.push(");
+        for rule in [
+            "overlap",
+            "below-min",
+            "box-grown",
+            "not-clipped",
+            "paint-out",
+            "track-item-mismatch",
+            "h-scroll",
+        ] {
+            assert!(
+                html.contains(&format!("rule: \"{rule}\"")),
+                "不变量 `{rule}` 的断言不见了（不许为了变绿删规则）"
+            );
+            assert!(
+                !skipped_blocks
+                    .iter()
+                    .any(|b| b.contains(&format!("\"{rule}\""))),
+                "`{rule}` 是可以在本视口下判定的规则，**不允许**被标成跳过：{skipped_blocks:?}"
+            );
+        }
+        // 交互类规则同样不许被跳过洗白
+        for rule in ["pair-isolation", "guard-failed", "reopen-failed"] {
+            assert!(
+                html.contains(&format!("\"{rule}\"")),
+                "交互断言 `{rule}` 不见了"
+            );
+        }
+
+        // ---- ⑪ RC1/RC2（t29）：#app 即根节点、命中不许接受祖先、必须测真实布局、硬名单扩容 ----
+        // ① 结构上让 `#app` 自己就是根节点：轨道每次现算现写，静态 CSS 不再有与 DOM 结构不符的兜底
+        assert!(
+            html.contains("buildLayoutDom(TREE, appEl, true)"),
+            "#app 必须是根节点本身（多套一层就要靠静态模板匹配「唯一孩子」，那正是 RC1 的成因）"
+        );
+        assert!(
+            html.contains("const box = isRoot ? host : document.createElement(\"div\");"),
+            "根节点不许再建一层 .split 包裹"
+        );
+        assert!(
+            html.contains("if (!isRoot) {") && html.contains("nodes.set(node.id, box);"),
+            "根节点的 DOM 就是 #app（nodes.get(TREE.id) === appEl）"
+        );
+        // 静态 CSS 的 #app 兜底不许再是两列（`300px 1fr`），只允许单格占位
+        let app_css = css_block(html, "#app {");
+        assert!(
+            !css.contains("grid-template-columns: 300px 1fr") && !app_css.contains("300px"),
+            "#app 的静态兜底不许再写两列（与单孩子结构矛盾，正是 RC1）：{app_css}"
+        );
+        assert!(
+            app_css.contains("grid-template-columns: 100%"),
+            "#app 的静态兜底只能是单格占位，真实轨道由 applyLayout() 每次写入：{app_css}"
+        );
+        assert!(
+            html.contains("gridTemplateColumns = px") && html.contains("gridTemplateRows = px"),
+            "applyLayout() 必须真的把求解结果写成轨道（不许依赖静态 CSS 兜底）"
+        );
+        // ② 命中判定不再接受祖先命中
+        assert!(
+            html.contains("hit === el || el.contains(hit)"),
+            "命中判定必须是「元素本身或其子孙」"
+        );
+        assert!(
+            !html.contains("el.contains(hit) || hit.contains(el)"),
+            "命中判定不许再接受祖先命中（命中祖先 = 被祖先裁剪，旧写法把裁剪读成通过 —— RC2①）"
+        );
+        assert!(
+            html.contains("describeHit(hit)"),
+            "报错必须点名命中的元素（否则分不清是被谁挡住/裁掉）"
+        );
+        // ③ 必须把「真实布局」作为第一个被测状态（不覆写 #app 宽高）
+        assert!(
+            html.contains("real: true") && html.contains("真实布局"),
+            "harness 必须在不覆写 #app 宽高的前提下先测一次真实布局（RC2②：它就是这次漏检的根因）"
+        );
+        assert!(
+            html.contains("appEl.style.width = saved.width;\n      appEl.style.height = saved.height;\n      const realRes = applyLayout();"),
+            "真实布局状态必须先用**保存下来的原尺寸**再求解"
+        );
+        // ④ region-clipped（硬规则）：几何裁剪检查 + region-covered（命中检查，可跳过）
+        assert!(
+            html.contains("rule: \"region-clipped\"") && html.contains("el.parentElement"),
+            "harness 必须有 region-clipped：区域不得超出任何祖先容器的矩形（与视口无关）"
+        );
+        assert!(
+            html.contains("rule: \"region-covered\"")
+                && html.contains("Math.min(r.right, viewport.w)"),
+            "harness 必须有 region-covered：在「区域 ∩ 真实视口」的中心取命中，命中祖先是错误"
+        );
+        // ⑤ 跳过硬名单扩容：这些规则一条都不许出现在 skipped.push 块里
+        for rule in [
+            "region-clipped",
+            "pair-isolation",
+            "guard-failed",
+            "reopen-failed",
+        ] {
+            assert!(
+                html.contains(&format!("\"{rule}\"")),
+                "规则 `{rule}` 不见了（不许为了变绿删规则）"
+            );
+            assert!(
+                !skipped_blocks
+                    .iter()
+                    .any(|b| b.contains(&format!("\"{rule}\""))),
+                "`{rule}` 属于可判定的硬规则，**不允许**被标成跳过洗白：{skipped_blocks:?}"
+            );
+        }
+    }
+
+    /// 取 CSS 里第一条「针对 `[hidden]` 且声明 `display: none`」的规则：`(选择器, 特异性, 是否 !important)`。
+    fn hidden_display_none_rule(css: &str) -> Option<(String, (u32, u32, u32), bool)> {
+        let stripped = strip_css_comments(css);
+        for block in stripped.split('}') {
+            let Some((sel, body)) = block.split_once('{') else {
+                continue;
+            };
+            if !sel.contains("[hidden]") {
+                continue;
+            }
+            let declares_none = body.replace(' ', "").contains("display:none");
+            if !declares_none {
+                continue;
+            }
+            let sel = sel.trim().to_string();
+            let important = body.contains("!important");
+            let best = sel
+                .split(',')
+                .map(|one| (one.trim().to_string(), css_specificity(one.trim())))
+                .max_by_key(|(_, spec)| *spec);
+            if let Some((s, spec)) = best {
+                return Some((s, spec, important));
+            }
+        }
+        None
+    }
+
+    /// 计算选择器的 (id, class/attr/pseudo-class, type) 特异性。够用即可（本项目 CSS 无嵌套/无 :not）。
+    fn css_specificity(selector: &str) -> (u32, u32, u32) {
+        let bytes = selector.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+        let (mut a, mut b_, mut c) = (0u32, 0u32, 0u32);
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'#' => {
+                    a += 1;
+                    i += 1;
+                    while i < bytes.len() && ident(bytes[i]) {
+                        i += 1;
+                    }
+                }
+                b'.' | b'[' | b':' => {
+                    b_ += 1;
+                    i += 1;
+                    while i < bytes.len() && ident(bytes[i]) {
+                        i += 1;
+                    }
+                }
+                byte if byte.is_ascii_alphabetic() => {
+                    c += 1;
+                    while i < bytes.len() && ident(bytes[i]) {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        (a, b_, c)
+    }
+
+    /// 把源码里每个 `marker` 之后的一段文本抓出来（用于「某规则有没有出现在 skipped 里」这类检查）。
+    fn collect_blocks(src: &str, marker: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = src;
+        while let Some(idx) = rest.find(marker) {
+            let tail = &rest[idx..];
+            out.push(tail.chars().take(400).collect::<String>());
+            rest = &tail[marker.len()..];
+        }
+        out
+    }
+
+    /// 删掉 CSS 注释（注释里会出现 `{`/`}`/`;`，不先删掉按规则切分会误判）。
     fn strip_css_comments(css: &str) -> String {
         let mut out = String::with_capacity(css.len());
         let mut rest = css;
@@ -1037,142 +1689,46 @@ mod tests {
             out.push_str(&rest[..start]);
             match rest[start + 2..].find("*/") {
                 Some(end) => rest = &rest[start + 2 + end + 2..],
-                None => return out, // 注释没闭合：后面全部丢弃
+                None => return out,
             }
         }
         out.push_str(rest);
         out
     }
 
-    /// 把样式表拆成 (选择器, 声明块) 列表。
-    ///
-    /// 只按 `{` / `}` 切分，不处理嵌套与 `@media`——本文件的样式表没有这些，
-    /// 而这个助手只服务于下面的布局不变量断言，故意保持极小。
-    fn css_rules(css: &str) -> Vec<(String, String)> {
-        let stripped = strip_css_comments(css);
-        let mut out = Vec::new();
-        for block in stripped.split('}') {
-            let Some((sel, body)) = block.split_once('{') else {
-                continue;
-            };
-            let sel = sel.trim();
-            if sel.is_empty() {
-                continue;
-            }
-            out.push((sel.to_string(), body.trim().to_string()));
-        }
-        out
+    /// 取区域表里某个区域的 def 文本（`params: { ... },` 这一段）。
+    fn region_block<'a>(src: &'a str, id: &str) -> &'a str {
+        let marker = format!("\n    {id}: {{");
+        let start = src
+            .find(&marker)
+            .unwrap_or_else(|| panic!("ui/layout.js 的区域表里没有 {id}"));
+        let rest = &src[start..];
+        let end = rest.find("\n    },").unwrap_or(rest.len());
+        &rest[..end]
     }
 
-    /// 取某个选择器（精确匹配）的声明块。
-    fn css_decls(rules: &[(String, String)], selector: &str) -> String {
-        rules
-            .iter()
-            .filter(|(sel, _)| sel.split(',').any(|s| s.trim() == selector))
-            .map(|(_, body)| body.as_str())
-            .collect::<Vec<_>>()
-            .join("; ")
+    /// 取 `key: 123` 里的数字（取不到就 panic，避免断言被悄悄放过）。
+    fn number_after(src: &str, key: &str) -> u64 {
+        let idx = src
+            .find(key)
+            .unwrap_or_else(|| panic!("缺少 `{key}`：{src}"));
+        src[idx + key.len()..]
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|e| panic!("`{key}` 后面不是数字: {e}"))
     }
 
-    /// 断言某个选择器的声明里含有某段子串（去掉多余空白后比较）。
-    fn assert_decl(rules: &[(String, String)], selector: &str, needle: &str) {
-        let got = css_decls(rules, selector).replace('\n', " ");
-        let got_squeezed: String = got.split_whitespace().collect::<Vec<_>>().join(" ");
-        let needle_squeezed: String = needle.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            got_squeezed.contains(&needle_squeezed),
-            "选择器 `{selector}` 必须包含 `{needle}`，实际声明为: {got_squeezed}"
-        );
-    }
-
-    /// t17 布局缺陷的回归闸门。
-    ///
-    /// 背景（详见 `ui/index.html` 顶部的根因注释）：页面是 body 上的纵向 flexbox，
-    /// 一旦「固定内容区」被允许收缩，它们的内容就会溢出到兄弟节点上（重叠/被挤出可视区）。
-    /// 这个测试把修复所依赖的**结构不变量**钉住——它不能替代真机截图，
-    /// 但只要有人把布局改回症状补丁或删掉关键约束，`cargo test` 就会红。
-    #[test]
-    fn layout_invariants_prevent_the_receive_pane_from_squeezing_others() {
-        let html = include_str!("../ui/index.html");
-        let css = html
-            .split_once("<style>")
-            .and_then(|(_, rest)| rest.split_once("</style>"))
-            .map(|(css, _)| css)
-            .expect("index.html 必须有 <style> 块");
-        let rules = css_rules(css);
-        assert!(!rules.is_empty(), "样式表没解析出任何规则");
-
-        // ① 页面是限高的纵向 flexbox，且有溢出兜底（否则内容一多整页长高、下方被切掉）。
-        assert_decl(&rules, "body", "display: flex");
-        assert_decl(&rules, "body", "flex-direction: column");
-        assert_decl(&rules, "body", "height: 100%");
-        assert_decl(&rules, "body", "overflow: auto");
-        // `html, body { height: 100% }`：按逗号拆开后查询 `html` 即可命中该规则。
-        assert_decl(&rules, "html", "height: 100%");
-
-        // ② 固定内容区**永不收缩**：这是「不再重叠」的核心（内容永不溢出到兄弟身上）。
-        assert_decl(&rules, "fieldset.fixed", "flex: 0 0 auto");
-        assert_decl(&rules, ".row", "flex: 0 0 auto");
-        assert_decl(&rules, "#log", "flex: 0 0 auto");
-
-        // ③ 接收区是唯一的伸缩区，而且必须能缩到内容高度以下（min-height: 0）。
-        assert_decl(&rules, "fieldset.pane", "flex: 1 1 auto");
-        assert_decl(&rules, "fieldset.pane", "min-height: 0");
-        assert_decl(&rules, "#rx", "flex: 1 1 auto");
-        assert_decl(&rules, "#rx", "min-height: 0");
-        assert_decl(&rules, "#rx", "overflow: auto");
-
-        // ④ 症状补丁的指纹必须不存在：给接收区/页面写死像素高度或像素下限。
-        for selector in ["#rx", "fieldset.pane", "body"] {
-            let decls = css_decls(&rules, selector);
-            for (idx, _) in decls.match_indices("min-height:") {
-                let tail = &decls[idx + "min-height:".len()..];
-                let value: String = tail
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| *c != ';' && *c != ' ')
-                    .collect();
-                assert!(
-                    !value.ends_with("px"),
-                    "`{selector}` 不允许用像素 min-height（{value}）凑布局：\
-                     那会在别的窗口尺寸下把下方区域顶出去"
-                );
-            }
-            for (idx, _) in decls.match_indices("height:") {
-                let tail = &decls[idx + "height:".len()..];
-                let value: String = tail
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| *c != ';' && *c != ' ')
-                    .collect();
-                assert!(
-                    !value.ends_with("px") || selector == "body",
-                    "`{selector}` 不允许写死像素高度（{value}）：布局应由 flex 分配，\
-                     而不是在某一种窗口尺寸下凑对"
-                );
-            }
-        }
-
-        // ⑤ 长行不许撑宽页面：接收区与日志面板都必须允许任意断行（min-content 宽度才不会失控）。
-        assert_decl(&rules, "#rx", "overflow-wrap: anywhere");
-        assert_decl(&rules, "#rx", "white-space: pre-wrap");
-        assert_decl(&rules, "#log", "overflow-wrap: anywhere");
-
-        // ⑥ CSS 与 HTML 必须对得上：类名不能只写在样式里。
-        assert_eq!(
-            html.matches("fieldset class=\"pane\"").count(),
-            1,
-            "必须恰好有一个 class=\"pane\" 的面板（接收区）"
-        );
-        assert_eq!(
-            html.matches("fieldset class=\"fixed\"").count(),
-            2,
-            "必须恰好有两个 class=\"fixed\" 的面板（发送区 + 事件区）"
-        );
-        assert!(
-            !strip_css_comments(css).contains(".grow"),
-            "旧的 `.grow` 规则已废弃：它把接收区与固定区混为一谈，正是挤压的来源"
-        );
+    /// 取样式表里某个选择器的声明块（`#app { ... }`）。
+    fn css_block<'a>(html: &'a str, selector: &str) -> &'a str {
+        let start = html
+            .find(selector)
+            .unwrap_or_else(|| panic!("样式表里找不到选择器 {selector}"));
+        let rest = &html[start + selector.len()..];
+        let end = rest.find('}').unwrap_or(rest.len());
+        &rest[..end]
     }
 
     #[test]
@@ -1315,7 +1871,510 @@ mod tests {
             parity: parity.into(),
             stop_bits: stop_bits.into(),
             flow_control: flow.into(),
+            repo_path: String::new(),
+            bin_path: String::new(),
         }
+    }
+
+    // ---- 固件指纹（增量 G2）-----------------------------------------------
+
+    fn frame_8n1() -> SerialFrame {
+        SerialFrame::default()
+    }
+
+    #[test]
+    fn optional_paths_are_trimmed_and_empty_means_absent() {
+        assert_eq!(optional_trimmed(""), None);
+        assert_eq!(optional_trimmed("   "), None);
+        assert_eq!(optional_trimmed("\t\n"), None);
+        assert_eq!(
+            optional_trimmed("  C:\\work\\repo  "),
+            Some(PathBuf::from("C:\\work\\repo"))
+        );
+        // 只有 bin、没有 repo：repo 仍是 None（不采集），bin 照样解析出来
+        let mut cfg = config("8", "none", "1", "none");
+        cfg.bin_path = " out\\fw.elf ".into();
+        let (repo, bin) = fingerprint_inputs(&cfg);
+        assert!(repo.is_none());
+        assert_eq!(bin, Some(PathBuf::from("out\\fw.elf")));
+    }
+
+    /// 来源配置里 baud 与帧格式之间**必须有分隔符**（t19 的列举发现过粘连缺陷）。
+    #[test]
+    fn source_config_separates_baud_from_frame() {
+        let cfg = config("8", "even", "1", "rtscts");
+        let meta = build_session_meta(&cfg, "COM14", &frame_8n1());
+        assert_eq!(meta.source_config, "serial:COM14@115200 8N1 无流控");
+        assert!(
+            !meta.source_config.contains("1152008N1"),
+            "baud 与帧格式不许粘在一起: {}",
+            meta.source_config
+        );
+        // 带流控/校验的帧也一样
+        let frame = parse_frame_from_config(&cfg).unwrap();
+        let meta = build_session_meta(&cfg, "COM7", &frame);
+        assert_eq!(meta.source_config, "serial:COM7@115200 8E1 RTS/CTS");
+        assert!(meta.source_config.contains(' '), "{}", meta.source_config);
+    }
+
+    /// 没填仓库路径 → 会话头里必须是「未采集 + 原因」，**不得静默**。
+    #[test]
+    fn meta_without_repo_records_not_collected_reason() {
+        let meta = build_session_meta(&config("8", "none", "1", "none"), "COM_TEST", &frame_8n1());
+        assert!(meta.fingerprint.collected.is_none());
+        assert_eq!(
+            meta.fingerprint.not_collected.as_deref(),
+            Some(embhub_core::FINGERPRINT_NOT_COLLECTED),
+            "未采集必须带 core 给的原因"
+        );
+    }
+
+    /// 填了仓库路径 → 真的采集（本仓库是 git 仓库）并带上 commit/dirty/bin_hash。
+    #[test]
+    fn meta_with_repo_collects_fingerprint_with_commit_dirty_and_bin_hash() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf(); // 工作区根
+        let bin = repo.join("docs").join("SPEC.md");
+        let mut cfg = config("8", "none", "1", "none");
+        cfg.repo_path = repo.display().to_string();
+        cfg.bin_path = bin.display().to_string();
+
+        let meta = build_session_meta(&cfg, "COM_TEST", &frame_8n1());
+        let fp = meta
+            .fingerprint
+            .collected
+            .as_ref()
+            .expect("填了仓库路径就必须采集到指纹段");
+        assert!(meta.fingerprint.not_collected.is_none());
+
+        let commit = fp
+            .commit
+            .value()
+            .unwrap_or_else(|| panic!("本仓库是 git 仓库，commit 应采集到: {:?}", fp.commit));
+        assert_eq!(commit.len(), 40, "commit 必须是完整 40 位 hex: {commit}");
+        assert!(commit.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(fp.dirty.value().is_some(), "dirty 应该能判定出来");
+        let bin_hash = fp.bin_hash.value().expect("给了 bin 文件就该有 bin_hash");
+        assert!(bin_hash.starts_with("sha256:"), "{bin_hash}");
+        assert_eq!(bin_hash.len(), "sha256:".len() + 64);
+    }
+
+    /// 采集失败：core 的每个字段缺失原因都必须留着（界面要原样打印，不许只说「采集失败」）。
+    #[test]
+    fn meta_with_bad_repo_surfaces_every_core_missing_reason() {
+        let ghost = temp_root("fp-ghost-repo").join("definitely-not-a-repo");
+        let mut cfg = config("8", "none", "1", "none");
+        cfg.repo_path = ghost.display().to_string();
+
+        let meta = build_session_meta(&cfg, "COM_TEST", &frame_8n1());
+        let fp = meta
+            .fingerprint
+            .collected
+            .as_ref()
+            .expect("采集入口一旦给了路径就会产出指纹段（字段级缺失，而不是整段缺失）");
+        let missing = fp.missing();
+        assert!(!missing.is_empty(), "取不到就必须有原因: {fp:?}");
+        for (name, reason) in &missing {
+            assert!(!reason.trim().is_empty(), "字段 {name} 的原因不得为空");
+        }
+        // 关键字段都应有原因，且能指名道姓
+        for key in ["commit", "dirty", "bin_hash"] {
+            assert!(
+                missing.iter().any(|(k, _)| *k == key),
+                "缺少 {key} 的缺失原因: {missing:?}"
+            );
+        }
+        assert!(fp.commit.value().is_none(), "不存在的仓库不该给出 commit");
+    }
+
+    /// 给了仓库但 bin 文件不存在：commit 仍有值，bin_hash 带**具体原因**。
+    #[test]
+    fn meta_with_missing_bin_keeps_bin_hash_reason() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut cfg = config("8", "none", "1", "none");
+        cfg.repo_path = repo.display().to_string();
+        cfg.bin_path = repo.join("no-such-firmware.elf").display().to_string();
+
+        let meta = build_session_meta(&cfg, "COM_TEST", &frame_8n1());
+        let fp = meta.fingerprint.collected.as_ref().unwrap();
+        assert!(fp.commit.value().is_some(), "commit 仍应采集到");
+        let reason = fp
+            .bin_hash
+            .reason()
+            .expect("bin 不存在时 bin_hash 必须带原因");
+        assert!(!reason.trim().is_empty());
+        assert!(
+            reason.contains("no-such-firmware.elf")
+                || reason.contains("不存在")
+                || reason.contains("No such"),
+            "原因要能指明是哪个文件/什么错: {reason}"
+        );
+    }
+
+    // ---- 日志列表 ---------------------------------------------------------
+
+    #[test]
+    fn sessions_root_defaults_to_the_data_dir_and_explicit_wins() {
+        let default_root = sessions_root_for(None);
+        assert_eq!(
+            default_root.file_name().and_then(|n| n.to_str()),
+            Some("sessions"),
+            "{default_root:?}"
+        );
+        assert_eq!(sessions_root_for(Some("   ")), default_root, "空白 = 没填");
+        assert_eq!(
+            sessions_root_for(Some("  D:\\logs\\s  ")),
+            PathBuf::from("D:\\logs\\s"),
+            "填了就以填的为准（去首尾空白）"
+        );
+    }
+
+    #[test]
+    fn session_list_dto_keeps_fingerprint_reason_and_flags_emptiness() {
+        // 空目录：必须给出「没有会话」的依据
+        let empty = temp_root("list-dto-empty");
+        let dto = session_list_dto(embhub_core::list_sessions(&empty));
+        assert!(dto.is_empty);
+        assert_eq!(dto.sessions.len(), 0);
+        assert!(dto.root_problem.is_none());
+        std::fs::remove_dir_all(&empty).ok();
+
+        // 一个真会话（未采集指纹）+ 一个坏会话
+        let root = temp_root("list-dto");
+        let store = LogStore::new(&root, 4096);
+        let id = store
+            .create_session(&SessionMeta::new("serial:COM14@115200 8N1 无流控"))
+            .unwrap();
+        store
+            .append(
+                &id,
+                &embhub_core::Chunk {
+                    t_mono: 1,
+                    payload: &[0xAB; 32],
+                },
+            )
+            .unwrap();
+        store.seal(&id).unwrap();
+        let broken = root.join("s-broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("header.bin"), b"junk").unwrap();
+
+        let dto = session_list_dto(embhub_core::list_sessions(&root));
+        assert!(!dto.is_empty);
+        assert_eq!(dto.sessions.len(), 2);
+        assert_eq!(dto.ok_count, 1);
+        assert_eq!(dto.broken_count, 1);
+
+        let good = dto.sessions.iter().find(|s| s.id == id.0).unwrap();
+        assert_eq!(
+            good.source_config.as_deref(),
+            Some("serial:COM14@115200 8N1 无流控")
+        );
+        assert_eq!(good.payload_bytes, 32);
+        assert!(good.problem.is_none());
+        let fp = good.fingerprint.as_ref().expect("必须有指纹段");
+        assert!(fp.collected.is_none());
+        assert_eq!(
+            fp.not_collected.as_deref(),
+            Some(embhub_core::FINGERPRINT_NOT_COLLECTED),
+            "未采集原因必须原样带到界面"
+        );
+
+        let bad = dto.sessions.iter().find(|s| s.id == "s-broken").unwrap();
+        assert!(
+            bad.problem.as_deref().unwrap_or("").contains("太短"),
+            "{:?}",
+            bad.problem
+        );
+        assert!(bad.fingerprint.is_none(), "头读不到时没有指纹段可展示");
+        assert!(bad.start_wall_ms.is_none());
+        assert!(dto.root.ends_with("list-dto") || dto.root.contains("list-dto"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **GUI 的整条数据链一次走通**（不用开窗）：
+    /// 配置对象 → `fingerprint::collect` → 写进 v2 会话头 → 从磁盘回读 → 列表 DTO 里的指纹摘要。
+    #[test]
+    fn gui_path_end_to_end_fingerprint_reaches_the_session_list() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut cfg = config("8", "even", "1", "rtscts");
+        cfg.repo_path = repo.display().to_string();
+        cfg.bin_path = repo.join("docs").join("SPEC.md").display().to_string();
+        let frame = parse_frame_from_config(&cfg).unwrap();
+
+        // ① 打开会话时构造的元数据（含指纹，且来源配置带分隔符）
+        let meta = build_session_meta(&cfg, "COM14", &frame);
+        assert_eq!(meta.source_config, "serial:COM14@115200 8E1 RTS/CTS");
+
+        // ② 按 v2 路径落盘
+        let root = temp_root("gui-e2e");
+        let store = LogStore::new(&root, 4096);
+        let id = store.create_session(&meta).unwrap();
+        store
+            .append(
+                &id,
+                &embhub_core::Chunk {
+                    t_mono: 1,
+                    payload: &[0xCD; 16],
+                },
+            )
+            .unwrap();
+        store.seal(&id).unwrap();
+
+        // ③ 界面打开会话后就是这么取指纹的：回读磁盘会话头
+        let header = embhub_core::read_session_header(&root.join(&id.0)).unwrap();
+        let on_disk = header
+            .fingerprint
+            .collected
+            .as_ref()
+            .expect("指纹必须真的写进了磁盘");
+        assert_eq!(on_disk.commit.value().map(|c| c.len()), Some(40));
+        assert!(on_disk.bin_hash.value().unwrap().starts_with("sha256:"));
+        assert!(on_disk.dirty.value().is_some());
+
+        // ④ 界面打开「日志列表」时走的就是这条：list_sessions → DTO
+        let dto = session_list_dto(embhub_core::list_sessions(&root));
+        let row = dto.sessions.iter().find(|s| s.id == id.0).unwrap();
+        let shown = row
+            .fingerprint
+            .as_ref()
+            .and_then(|fp| fp.collected.as_ref())
+            .expect("列表里必须看得到指纹");
+        assert_eq!(shown.commit.value(), on_disk.commit.value());
+        assert_eq!(shown.bin_hash.value(), on_disk.bin_hash.value());
+        assert_eq!(shown.dirty.value(), on_disk.dirty.value());
+        assert_eq!(row.payload_bytes, 16);
+        assert_eq!(
+            row.source_config.as_deref(),
+            Some("serial:COM14@115200 8E1 RTS/CTS")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **JSON 键名以 core 实体为准**（修订版第 5 条）：`SessionSummary` 是 camelCase，
+    /// 而 `fingerprint` 子对象沿用磁盘会话头的 `collected` / `not_collected`，
+    /// 字段值是 `{Value|Missing}` —— 同一个 Rust 类型，一处定义两处使用。
+    /// 这条测试把「不许为了统一命名而加 `serde(rename)` / 另造形状」钉住。
+    #[test]
+    fn fingerprint_json_keys_stay_exactly_as_the_on_disk_header() {
+        // ① core 类型本身：键名与磁盘头一致
+        let not_collected = FingerprintSection::not_collected("测试用未采集原因");
+        let json = serde_json::to_string(&not_collected).unwrap();
+        assert!(json.contains("\"collected\":null"), "{json}");
+        assert!(
+            json.contains("\"not_collected\":\"测试用未采集原因\""),
+            "{json}"
+        );
+
+        // ② 已采集：字段名仍是磁盘格式的 snake_case，值仍是 {Value|Missing}
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let collected =
+            FingerprintSection::collected(embhub_core::fingerprint::collect(&repo, None));
+        let json = serde_json::to_string(&collected).unwrap();
+        assert!(
+            json.contains("\"bin_hash\""),
+            "字段名必须与磁盘头一致: {json}"
+        );
+        assert!(
+            json.contains("\"Value\"") || json.contains("\"Missing\""),
+            "字段值必须是 Field 的 {{Value|Missing}} 外部标签形式: {json}"
+        );
+
+        // ③ 界面拿到的列表 DTO：app 自己的字段是 snake_case（与其它 DTO 一致），
+        //    但 fingerprint 子对象的键名**原样**是 collected / not_collected。
+        let root = temp_root("json-keys");
+        let store = LogStore::new(&root, 4096);
+        let id = store
+            .create_session(&SessionMeta::new("serial:COM_TEST@115200"))
+            .unwrap();
+        store.seal(&id).unwrap();
+        let dto = session_list_dto(embhub_core::list_sessions(&root));
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            json.contains("\"not_collected\""),
+            "指纹键名不许被改：{json}"
+        );
+        assert!(
+            !json.contains("\"notCollected\""),
+            "禁止把 not_collected 改成 camelCase：{json}"
+        );
+        assert!(
+            json.contains("\"payload_bytes\""),
+            "app 自己的字段用 snake_case：{json}"
+        );
+        assert!(json.contains("\"is_empty\""), "{json}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- 工程约束（命令集对称 / id 完整 / 绝不碰仓库）---------------------
+
+    /// 前端 `invoke("...")` 的命令集必须与后端 `generate_handler!` **完全一致**（双向对称）。
+    #[test]
+    fn ui_command_set_is_symmetric_with_the_backend() {
+        let src = include_str!("main.rs");
+        // main() 里的注册表是文件中第一处 `generate_handler![`（测试模块在文件末尾）。
+        let registered: Vec<String> = src
+            .split_once("generate_handler![")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| {
+                list.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && !s.starts_with("//"))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .expect("找不到 generate_handler! 注册表");
+        assert!(registered.len() >= 7, "{registered:?}");
+
+        let html = include_str!("../ui/index.html");
+        let invoked: Vec<String> = html
+            .match_indices("invoke(\"")
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect();
+        let mut invoked_sorted = invoked.clone();
+        invoked_sorted.sort();
+        invoked_sorted.dedup();
+
+        for cmd in &invoked_sorted {
+            assert!(
+                registered.contains(cmd),
+                "前端调用了后端没注册的命令 {cmd}（注册表: {registered:?}）"
+            );
+        }
+        for cmd in &registered {
+            assert!(
+                invoked_sorted.contains(cmd),
+                "后端注册了命令 {cmd}，但前端从未调用（命令集必须双向对称）"
+            );
+        }
+        // G1 的列举能力必须在界面上真的被用起来（不是只注册不用）
+        assert!(invoked_sorted.contains(&"list_sessions".to_string()));
+    }
+
+    /// 前端引用的元素 id 必须全部有定义（拼错 id 只会在运行时静默坏掉）。
+    #[test]
+    fn ui_referenced_element_ids_are_all_defined() {
+        let html = include_str!("../ui/index.html");
+        let defined: Vec<&str> = html
+            .match_indices("id=\"")
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        let mut referenced: Vec<&str> = html
+            .match_indices("getElementById(\"")
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        referenced.sort();
+        referenced.dedup();
+        assert!(
+            referenced.len() >= 20,
+            "至少该引用到 20 个元素: {referenced:?}"
+        );
+        for id in &referenced {
+            assert!(
+                defined.contains(id),
+                "JS 引用了未定义的 id：{id}（定义: {defined:?}）"
+            );
+        }
+    }
+
+    /// **绝不改变用户仓库状态**：生产代码里不许出现会动工作区的 git 子命令。
+    ///
+    /// 只扫 `#[cfg(test)]` **之前**的生产代码——测试模块天生要写下这些词（“不许出现什么”），
+    /// 不该被自己扫到。
+    #[test]
+    fn app_never_mutates_the_repository() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("源码里应有生产代码部分");
+        assert!(production.contains("fn main"), "生产代码切片不对");
+        assert!(
+            !production.contains("#[test]") && production.contains("fn open_session"),
+            "生产代码切片不该包含测试代码"
+        );
+        for needle in [
+            "checkout",
+            "switch",
+            "reset",
+            "--hard",
+            "clean -fd",
+            "git branch",
+            "stash",
+        ] {
+            assert!(
+                !production.contains(needle),
+                "生产代码里不允许出现 `{needle}`（本阶段明确要求不碰用户仓库）"
+            );
+        }
+        // 唯一允许的 git 交互：core 的只读采集入口。
+        assert!(
+            src.contains("fingerprint::collect"),
+            "指纹应通过 core 的只读采集入口取得"
+        );
+    }
+
+    /// 界面必须**在打开之前**就说明「没有指纹」这件事（核心验收点，防复发）。
+    #[test]
+    fn ui_states_that_a_session_without_repo_has_no_fingerprint() {
+        let html = include_str!("../ui/index.html");
+        assert!(
+            html.contains("本会话日志将不包含固件指纹"),
+            "参数区必须明写「本会话日志将不包含固件指纹」"
+        );
+        assert!(html.contains("id=\"repoPath\"") && html.contains("id=\"binPath\""));
+        // 打开之后的指纹状态行容器：新模型里**内容容器由区域 API 创建**，
+        // 所以它不再以 `id="fpStatus"` 的形式写在 HTML 里，而是 JS 建好后挂进参数区。
+        assert!(
+            html.contains("fpStatusEl.id = \"fpStatus\""),
+            "指纹状态行容器必须存在（新模型里由区域 API 创建）"
+        );
+        assert!(
+            html.contains("regions.get(\"params\").body.appendChild(fpStatusEl)"),
+            "指纹状态行必须挂在参数区（regions.get(\"params\")）里"
+        );
+        assert!(
+            html.contains("not_collected"),
+            "界面要消费磁盘头的 not_collected 键名"
+        );
+        assert!(
+            html.contains("fpReason"),
+            "取不到的字段必须打印 Field::Missing 的原因原文"
+        );
+        // 复制 commit 的入口
+        assert!(html.contains("复制 commit"));
+        assert!(html.contains("navigator.clipboard"));
+        // 列表浮层与「没有会话」
+        assert!(html.contains("没有会话"));
+        assert!(html.contains("id=\"sessionList\""));
     }
 
     #[test]

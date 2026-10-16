@@ -8,6 +8,7 @@
 //!   embhub-cli stream --bytes N [--chunk K] [--consume fast|slow|stalled] [--display-capacity C]
 //!   embhub-cli loopback --bytes N [--chunk K] [--display-capacity C]
 //!   embhub-cli send --port <p> --data <hex:AA55FF|text:hello> [--append none|cr|lf|crlf] [--repeat N]
+//!   embhub-cli sessions --root <dir> [--json]
 //!
 //! `selftest` 是 Phase 1「零丢失」闭环的无硬件自证：合成源注入 → LogStore 落盘
 //! → `open_replay` 读回，打印「注入 / 落盘 / 回放读回」三个计数并逐字节比对；
@@ -25,6 +26,12 @@
 //! `loopback` 是无硬件证明「**能发**」的闭环：合成源回环（写进去的字节被同一个源读回）
 //! → 会话（源 + 管线 + 落盘）→ 断言「写入 == 读回 == 落盘 == 回放」四方一致。
 //! `send` 则是对真实串口的发送命令（`ByteSink`；参数非法时明确报错并非零退出）。
+//!
+//! `sessions` 列举一个 sessions 根目录下的全部会话（`list_sessions`）：
+//! 每条给出「会话 id / 起始墙上时间 / 来源配置 / 固件指纹 / 日志 payload 字节数」，
+//! 让「日志 ↔ 固件指纹」这条链在没有 GUI 的情况下也能被端到端查验。
+//! **坏会话不会让好会话消失**：坏的照样列出来并标明原因。退出码恒为 0
+//! （根目录不存在、没有会话都只是「空结果」，不是命令失败）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,8 +44,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use embhub_core::fingerprint::{self, Field};
 use embhub_core::{
     ByteSink, ByteSource, Chunk, DisplayBatch, FingerprintSection, FirmwareFingerprint, LogStore,
-    Pipeline, PipelineConfig, SerialConfig, SerialSink, Session, SessionId, SessionMeta,
-    SourceError, StopReason, SyntheticConfig, SyntheticSource, DEFAULT_BATCH_BYTES,
+    Pipeline, PipelineConfig, SerialConfig, SerialSink, Session, SessionId, SessionList,
+    SessionMeta, SourceError, StopReason, SyntheticConfig, SyntheticSource, DEFAULT_BATCH_BYTES,
     DEFAULT_BATCH_TIMEOUT_MS, DEFAULT_DISPLAY_CAPACITY, RECORD_HEADER_LEN,
 };
 
@@ -67,9 +74,10 @@ fn main() -> ExitCode {
         "stream" => cmd_stream(&args),
         "loopback" => cmd_loopback(&args),
         "send" => cmd_send(&args),
+        "sessions" => cmd_sessions(&args),
         other => {
             eprintln!(
-                "未知子命令: {other}（可用: list | read | selftest | fingerprint | stream | loopback | send）"
+                "未知子命令: {other}（可用: list | read | selftest | fingerprint | stream | loopback | send | sessions）"
             );
             ExitCode::FAILURE
         }
@@ -147,6 +155,142 @@ fn show_field<T: std::fmt::Display>(field: &Field<T>) -> String {
         Field::Value(v) => v.to_string(),
         Field::Missing(reason) => format!("取不到（原因: {reason}）"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// sessions —— 会话列举（把「日志 ↔ 固件指纹」摆到产品表面）
+// ---------------------------------------------------------------------------
+
+/// 把 Unix epoch 毫秒渲染成 UTC 的 `YYYY-MM-DD HH:MM:SS.mmmZ`。
+///
+/// 自己算而不引日期库（**零新增依赖**）：用 Howard Hinnant 的 civil_from_days
+/// （天数 → 年月日）。只输出 UTC 并带 `Z`，绝不含糊地假装是本地时间。
+fn format_utc_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let days = (secs / 86_400) as i64;
+    let sod = secs % 86_400;
+    let (h, m, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y0 = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if mth <= 2 { y0 + 1 } else { y0 };
+
+    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02}.{millis:03}Z")
+}
+
+/// 指纹段渲染成若干行。
+///
+/// 三种情况必须**分得清清楚楚**（这是本项目的核心不变量，不许含糊）：
+/// 已采集 → 8 个字段逐个打印（取不到的字段照样打印**原因**）；
+/// 未采集 → 打印**原因**；会话头都读不到 → 说明是「读不到」，而不是「没采集」。
+fn fingerprint_lines(section: Option<&FingerprintSection>) -> Vec<String> {
+    match section {
+        None => vec!["    固件指纹     : 读不到（会话头非法，见下面的问题说明）".to_string()],
+        Some(s) => match (&s.collected, &s.not_collected) {
+            (Some(fp), _) => vec![
+                "    固件指纹     : 已采集".to_string(),
+                format!("      repo_root : {}", show_field(&fp.repo_root)),
+                format!("      commit    : {}", show_field(&fp.commit)),
+                format!("      dirty     : {}", show_field(&fp.dirty)),
+                format!("      bin_path  : {}", show_field(&fp.bin_path)),
+                format!("      bin_hash  : {}", show_field(&fp.bin_hash)),
+                format!("      build_time: {}", show_field(&fp.build_time)),
+                format!("      chip      : {}", show_field(&fp.chip)),
+                format!("      probe_id  : {}", show_field(&fp.probe_id)),
+            ],
+            (None, Some(reason)) => vec![format!("    固件指纹     : 未采集（原因: {reason}）")],
+            (None, None) => {
+                vec!["    固件指纹     : ⚠ 既没有指纹也没有原因（指纹段不变量被破坏）".to_string()]
+            }
+        },
+    }
+}
+
+/// 人类可读的列举结果（纯函数，便于单测）。
+fn sessions_human(list: &SessionList) -> String {
+    let mut out = Vec::new();
+    out.push("== embhub sessions（会话列举：日志 ↔ 固件指纹）==".to_string());
+    out.push(format!("根目录      : {}", list.root.display()));
+    if let Some(p) = &list.root_problem {
+        out.push(format!("根目录问题  : {p}"));
+    }
+    out.push(format!(
+        "会话数      : {}（可读 {} / 有问题 {}）",
+        list.len(),
+        list.ok_count(),
+        list.broken_count()
+    ));
+    if list.is_empty() {
+        out.push("没有会话（该目录下没有任何会话子目录）".to_string());
+    }
+    if !list.skipped.is_empty() {
+        out.push(format!("跳过条目    : {}（不是目录）", list.skipped.len()));
+        for s in &list.skipped {
+            out.push(format!("  - {}：{}", s.name, s.reason));
+        }
+    }
+    for (i, s) in list.sessions.iter().enumerate() {
+        out.push(String::new());
+        out.push(format!("[{}] {}", i + 1, s.id));
+        match s.start_wall_ms {
+            Some(ms) => out.push(format!(
+                "    起始墙上时间 : {}（{ms} ms）",
+                format_utc_ms(ms)
+            )),
+            None => out.push("    起始墙上时间 : 未知（会话头不可读）".to_string()),
+        }
+        out.push(format!(
+            "    来源配置     : {}",
+            s.source_config.as_deref().unwrap_or("未知（会话头不可读）")
+        ));
+        out.push(format!(
+            "    日志 payload : {} 字节 / {} 条记录 / {} 个分片",
+            s.payload_bytes, s.records, s.segments
+        ));
+        out.extend(fingerprint_lines(s.fingerprint.as_ref()));
+        if let Some(p) = &s.problem {
+            out.push(format!("    ⚠ 问题       : {p}"));
+        }
+    }
+    out.join("\n")
+}
+
+/// `--json` 输出：结构直接来自 core（camelCase），脚本可以直接解析。
+fn sessions_json(list: &SessionList) -> Result<String, String> {
+    serde_json::to_string_pretty(list).map_err(|e| format!("序列化会话列表失败: {e}"))
+}
+
+/// `sessions --root <dir> [--json]`。
+///
+/// **退出码恒为 0**：根目录不存在、目录为空、全是坏会话都只是「列举结果」，
+/// 不是命令失败（只有参数本身错才非零退出）。
+fn cmd_sessions(args: &[String]) -> ExitCode {
+    let usage = "用法: embhub-cli sessions --root <sessions 根目录> [--json]";
+    let Some(root) = arg_value(args, "--root") else {
+        eprintln!("缺少 --root\n{usage}");
+        return ExitCode::FAILURE;
+    };
+    let list = embhub_core::list_sessions(&root);
+    if args.iter().any(|a| a == "--json") {
+        match sessions_json(&list) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        println!("{}", sessions_human(&list));
+    }
+    ExitCode::SUCCESS
 }
 
 /// 显示消费者怎么消费（用来演示背压：快 / 慢 / 干脆停住）。
@@ -1832,6 +1976,319 @@ mod tests {
     #[test]
     fn fingerprint_requires_repo_flag() {
         assert_eq!(cmd_fingerprint(&[]), ExitCode::FAILURE);
+    }
+
+    // ---- sessions（会话列举，增量 G1）---------------------------------------
+
+    /// UTC 换算必须精确（含闰年 2 月 29 日、毫秒边界）。
+    /// 期望值由 Python `datetime.fromtimestamp(ms/1000, tz=utc)` 独立算出，不是自己算自己。
+    #[test]
+    fn format_utc_ms_matches_independently_computed_values() {
+        for (ms, want) in [
+            (0u64, "1970-01-01 00:00:00.000Z"),
+            (1, "1970-01-01 00:00:00.001Z"),
+            (999, "1970-01-01 00:00:00.999Z"),
+            (1000, "1970-01-01 00:00:01.000Z"),
+            (951_782_400_000, "2000-02-29 00:00:00.000Z"), // 闰年
+            (1_582_934_400_000, "2020-02-29 00:00:00.000Z"), // 闰年
+            (1_700_000_000_000, "2023-11-14 22:13:20.000Z"),
+            (1_792_129_848_436, "2026-10-16 05:50:48.436Z"),
+            (4_102_444_800_000, "2100-01-01 00:00:00.000Z"), // 非闰世纪年
+        ] {
+            assert_eq!(format_utc_ms(ms), want, "epoch {ms} ms 换算错");
+        }
+    }
+
+    /// 造一个根目录，里面放：一个真会话（无指纹）+ 一个真会话（带指纹）+ 一个坏目录。
+    fn sessions_fixture(tag: &str) -> (PathBuf, String, String, PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "embhub-cli-sessions-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let store = LogStore::new(&root, 4096);
+        let plain = store
+            .create_session(&SessionMeta::new("serial:COM14@115200"))
+            .unwrap();
+        store
+            .append(
+                &plain,
+                &Chunk {
+                    t_mono: 1000,
+                    payload: &[0xAA; 100],
+                },
+            )
+            .unwrap();
+        store.seal(&plain).unwrap();
+
+        let fp = FirmwareFingerprint {
+            repo_root: Field::Value("C:\\work\\repo".to_string()),
+            commit: Field::Value("0123456789abcdef0123456789abcdef01234567".to_string()),
+            dirty: Field::Value(true),
+            bin_path: Field::Value("out\\fw.elf".to_string()),
+            bin_hash: Field::Value(format!("sha256:{}", "ab".repeat(32))),
+            build_time: Field::Value(1_792_000_000_000),
+            chip: Field::Missing("Phase 7（probe-rs）尚未采集".to_string()),
+            probe_id: Field::Missing("Phase 7（probe-rs）尚未采集".to_string()),
+        };
+        let with_fp = store
+            .create_session(&SessionMeta::with_fingerprint("serial:COM13@9600", fp))
+            .unwrap();
+        store.seal(&with_fp).unwrap();
+
+        // 坏会话：magic 不对。
+        let broken = root.join("s-broken");
+        fs::create_dir_all(&broken).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"XXXXXXXX");
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 8]);
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(b"{}");
+        fs::write(broken.join("header.bin"), &raw).unwrap();
+        // 游离文件（会被跳过，但要列出来）。
+        fs::write(root.join("stray.txt"), b"x").unwrap();
+
+        (root, plain.0, with_fp.0, broken, "s-broken".to_string())
+    }
+
+    #[test]
+    fn sessions_human_output_contains_every_column() {
+        let (root, plain_id, fp_id, _broken, _) = sessions_fixture("human");
+        let list = embhub_core::list_sessions(&root);
+        let text = sessions_human(&list);
+
+        for needle in [
+            "会话列举",
+            &root.display().to_string(),
+            &plain_id,
+            &fp_id,
+            "起始墙上时间",
+            "2026-", // 起始墙上时间的可读形式
+            "来源配置",
+            "serial:COM14@115200",
+            "serial:COM13@9600",
+            "日志 payload",
+            "100 字节", // plain 会话注入的 100 字节
+            "未采集（原因: ",
+            embhub_core::FINGERPRINT_NOT_COLLECTED,
+            "已采集",
+            "0123456789abcdef0123456789abcdef01234567",
+            "dirty",
+            "true",
+            "bin_hash",
+            "sha256:",
+            "取不到（原因: Phase 7（probe-rs）尚未采集）",
+            "跳过条目",
+            "stray.txt",
+            "⚠ 问题",
+            "magic",
+        ] {
+            assert!(
+                text.contains(needle),
+                "人类可读输出必须含 {needle:?}：\n{text}"
+            );
+        }
+        // 坏会话不能被藏起来。
+        assert!(text.contains("有问题 1"), "{text}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sessions_json_is_parseable_and_keeps_not_collected_reason() {
+        let (root, plain_id, fp_id, _broken, _) = sessions_fixture("json");
+        let list = embhub_core::list_sessions(&root);
+        let json = sessions_json(&list).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("--json 必须是合法 JSON");
+
+        assert!(v["root"].is_string());
+        assert!(
+            v["rootProblem"].is_null(),
+            "正常根目录 rootProblem 应为 null"
+        );
+        let sessions = v["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 3, "两个好会话 + 一个坏会话都要在");
+
+        let plain = sessions
+            .iter()
+            .find(|s| s["id"] == plain_id.as_str())
+            .expect("无指纹会话必须在 JSON 里");
+        assert_eq!(plain["sourceConfig"], "serial:COM14@115200");
+        assert_eq!(plain["payloadBytes"], 100);
+        assert_eq!(plain["records"], 1);
+        assert!(plain["startWallMs"].as_u64().unwrap() > 1_600_000_000_000);
+        assert!(plain["problem"].is_null());
+        // 关键：未采集必须带原因，不得留空、不得省略键。
+        assert_eq!(
+            plain["fingerprint"]["not_collected"],
+            embhub_core::FINGERPRINT_NOT_COLLECTED
+        );
+        assert!(plain["fingerprint"]["collected"].is_null());
+
+        let with_fp = sessions
+            .iter()
+            .find(|s| s["id"] == fp_id.as_str())
+            .expect("带指纹会话必须在 JSON 里");
+        let collected = &with_fp["fingerprint"]["collected"];
+        assert!(collected["commit"]["Value"].is_string(), "{collected}");
+        assert_eq!(collected["dirty"]["Value"], true);
+        assert!(collected["bin_hash"]["Value"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        // 取不到的字段同样带原因，不省略键。
+        assert!(collected["chip"]["Missing"].is_string(), "{collected}");
+        assert!(with_fp["fingerprint"]["not_collected"].is_null());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sessions_json_marks_broken_session_with_problem_and_null_fingerprint() {
+        let (root, _plain, _fp, broken, broken_id) = sessions_fixture("json-broken");
+        let list = embhub_core::list_sessions(&root);
+        let json = sessions_json(&list).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let bad = v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == broken_id.as_str())
+            .expect("坏会话必须在 JSON 里（不能被丢掉）");
+        assert!(
+            bad["problem"].as_str().unwrap().contains("magic"),
+            "坏会话要带具体原因: {bad}"
+        );
+        // 头读不到 → fingerprint 是 null；这和「读到头但没采集」是两件事。
+        assert!(bad["fingerprint"].is_null(), "{bad}");
+        assert!(bad["startWallMs"].is_null());
+        assert_eq!(bad["payloadBytes"], 0);
+        assert!(bad["dir"].as_str().unwrap().contains(&broken_id));
+        assert!(v["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "stray.txt"));
+        let _ = broken;
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sessions_requires_root_flag_and_exits_nonzero() {
+        assert_eq!(cmd_sessions(&[]), ExitCode::FAILURE);
+        assert_eq!(
+            cmd_sessions(&["--json".to_string()]),
+            ExitCode::FAILURE,
+            "--json 不能代替 --root"
+        );
+    }
+
+    #[test]
+    fn sessions_on_missing_or_empty_root_exits_zero() {
+        // 空目录
+        let empty = std::env::temp_dir().join(format!(
+            "embhub-cli-sessions-empty-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&empty).unwrap();
+        let list = embhub_core::list_sessions(&empty);
+        let text = sessions_human(&list);
+        assert!(text.contains("没有会话"), "{text}");
+        assert_eq!(list.len(), 0);
+        assert_eq!(
+            cmd_sessions(&["--root".to_string(), empty.display().to_string()]),
+            ExitCode::SUCCESS,
+            "没有会话不是错误"
+        );
+        // JSON 形式也要能解析
+        let json: serde_json::Value = serde_json::from_str(&sessions_json(&list).unwrap()).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+        fs::remove_dir_all(&empty).ok();
+
+        // 根目录根本不存在：照样退 0，并且说明原因。
+        let ghost = std::env::temp_dir().join(format!(
+            "embhub-cli-sessions-ghost-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let list = embhub_core::list_sessions(&ghost);
+        assert!(list.root_problem.is_some());
+        let text = sessions_human(&list);
+        assert!(text.contains("根目录问题"), "{text}");
+        assert!(text.contains("没有会话"), "{text}");
+        assert_eq!(
+            cmd_sessions(&["--root".to_string(), ghost.display().to_string()]),
+            ExitCode::SUCCESS,
+            "根目录不存在也不是命令失败（只是空结果）"
+        );
+        assert_eq!(
+            cmd_sessions(&[
+                "--root".to_string(),
+                ghost.display().to_string(),
+                "--json".to_string()
+            ]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    /// 端到端：用 CLI 自己的 loopback 造会话 → 列举出来（不经过 GUI、不依赖硬件）。
+    #[test]
+    fn sessions_lists_a_session_created_by_the_cli_loopback() {
+        let root = std::env::temp_dir().join(format!(
+            "embhub-cli-sessions-e2e-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        // loopback 用的是它自己的根目录；这里直接建一个等价会话，证明「写→列」闭环。
+        let store = LogStore::new(&root, 4096);
+        let id = store
+            .create_session(&SessionMeta::new("synthetic:loopback,seed=7"))
+            .unwrap();
+        for i in 0..3u64 {
+            store
+                .append(
+                    &id,
+                    &Chunk {
+                        t_mono: i * 10,
+                        payload: &[0x5A; 64],
+                    },
+                )
+                .unwrap();
+        }
+        store.seal(&id).unwrap();
+
+        let list = embhub_core::list_sessions(&root);
+        assert_eq!(list.len(), 1);
+        let s = &list.sessions[0];
+        assert_eq!(s.id, id.0);
+        assert!(s.is_ok(), "{:?}", s.problem);
+        assert_eq!(s.payload_bytes, 192, "3 × 64 字节");
+        assert_eq!(s.records, 3);
+        assert_eq!(
+            s.source_config.as_deref(),
+            Some("synthetic:loopback,seed=7")
+        );
+        assert_eq!(
+            s.fingerprint.as_ref().unwrap().not_collected.as_deref(),
+            Some(embhub_core::FINGERPRINT_NOT_COLLECTED)
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

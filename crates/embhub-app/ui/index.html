@@ -6,254 +6,754 @@
   <title>embhub — 串口助手</title>
   <style>
     /* ─────────────────────────────────────────────────────────────────────
-       布局根因说明（t17，别删）：为什么以前「接收区一长就把下面挤没 / 重叠」
-       ─────────────────────────────────────────────────────────────────────
-       这个页面是 body 上的**纵向 flexbox**，整页高度锁一屏（html/body 100%）。
-       纵向 flex 里有两类子项，规则必须分开写清楚，否则它们会互相挤：
-
-       A. 固定内容区（工具行、计数行、发送区、事件区）：高度只由内容决定，
-          必须 `flex: 0 0 auto`（**禁止收缩**）。以前所有 fieldset 都带
-          `min-height: 0`，于是它们也会被 flex-shrink 压扁；而 overflow 默认
-          visible，被压扁容器的内容就**直接溢出到下一个兄弟节点上**——
-          用户在截图里看到的「事件与错误标题与定时发送间隔行重叠」就是这么来的。
-
-       B. 接收区（.pane，唯一的伸缩区）：它要吃掉剩余高度并**自己滚动**，
-          需要两件事同时成立：
-            · `.pane { flex: 1 1 auto; min-height: 0 }` —— 纵向 flex 子项的
-              自动最小高度默认等于其内容的 min-content 高度（滚动容器才豁免），
-              `.pane` 自己不是滚动容器，不减到 0 就压不下去，剩余高度也就分不下来
-              （captain 初判的那条经典缺陷，作用点在这里）；
-            · 内部滚动容器 `#rx { flex: 1 1 auto; min-height: 0; overflow: auto }`
-              —— 滚动子项同样要能缩得比内容矮，overflow 才会真的生效。
-              以前 #rx 带着 `min-height: 110px` 硬下限，等于给接收区装了一条
-              「再挤也不小于 ~160px」的底线：窗口一矮就把别人顶出可视区。
-
-       所以修复不是给某个盒子写死高度，而是把「谁固定、谁伸缩、谁滚动」讲清楚：
-       · 固定区永不收缩 → 内容永远不会溢出到兄弟身上（不再重叠，也不再被顶出去）；
-       · 接收区可缩 + 内部滚动 → 内容再多也只在自己框里滚（页面布局高度不变）。
-       body 上的 `overflow: auto` 只是最后兜底：窗口小到连固定区都放不下时整页滚动，
-       而不是把内容切掉或压扁重叠。
+       布局模型（H1a，取代 t17 的「一列 flex 互相协商」）：
+         区域对象 + 分割树 + CSS Grid 显式轨道。
+       三条规矩，缺一条就会重现「内容一多就把别处挤没 / 重叠」：
+         ① 布局根是 #app，它有**明确的尺寸**（默认撑满 body，也能被程序设成 800x600 之类，
+            布局自检就靠这个模拟不同窗口）；区域**尺寸绝不随内容变化**；
+         ② 每个区域容器**强制裁剪**（overflow: hidden）+ 内部滚动容器（overflow: auto），
+            `min-width/min-height: 0` 保证它被压到最小值时不会反被内容顶大；
+         ③ 空间不足时区域**停在各最小值**（#app 的 min-* 就是最小值之和），
+            整页滚动兜底 —— **绝不允许把区域压到最小值以下，更不允许区域重叠**。
+       轨道由 layout.js 的求解结果写成显式 px，页面不自己算尺寸。
        ───────────────────────────────────────────────────────────────────── */
     :root { color-scheme: dark; }
-    html, body { height: 100%; }
     * { box-sizing: border-box; }
+    html, body { height: 100%; }
     body {
+      margin: 0; padding: 10px; background: #14161a; color: #d7dae0;
       font-family: "Cascadia Mono", Consolas, monospace;
-      margin: 0; padding: 12px; background: #14161a; color: #d7dae0;
-      display: flex; flex-direction: column; gap: 10px;
-      height: 100%;
-      overflow: auto;   /* 兜底，见上方根因说明 */
-      min-width: 0;
-      /* 继承给所有文本：长行（例如无换行的 HEX 串）只在自己的框里换行，
-         不会把面板、进而把整页撑出横向滚动条。 */
-      overflow-wrap: anywhere;
+      overflow: auto; /* 兜底：容器比最小值之和还小时整页滚动，而不是压扁/重叠 */
     }
-    /* A 类：固定内容区——尺寸只由内容决定，永不收缩。 */
-    h1, #paramsHint, #counters, .row { flex: 0 0 auto; min-width: 0; }
-    h1 { font-size: 14px; font-weight: 600; margin: 0; color: #8ab4f8; }
+    /* 布局根：**它就是根节点本身**（`nodes.get(TREE.id) === appEl`），轨道每次求解后现算现写。
+       这里只给「单格」兜底，不再写 `300px 1fr` 那种两列静态模板。
+       根因（真实 app 实测到的整块裁剪）：t23 之后 `#app` 只有 1 个孩子（根分割），
+       而静态 CSS 仍是 2 条轨道，`applyLayout()` 又从不写 `#app` 自己的模板 ⇒
+       唯一的根分割落进第 1 条 300px 轨道、它内部上千像素宽的内容被 `overflow: hidden`
+       整块裁掉（表现为「界面只剩参数区可见、分隔条落在被裁区域里，鼠标拖不到」）。
+       所以：结构上让 `#app` 自己当根节点，样式上不再留任何与 DOM 结构不一致的兜底。
+       gap 必须是 0：区域之间的间距由**分隔条轨道**提供（见 rebuildSplitters）。 */
+    #app {
+      display: grid;
+      grid-template-columns: 100%;   /* 单格兜底；真实轨道由 applyLayout() 每次写入 */
+      grid-template-rows: 100%;
+      gap: 0;
+      width: 100%;
+      height: 100%;
+      min-width: 320px;  /* JS 覆盖为「可见区域最小值之和」 */
+      min-height: 240px;
+      overflow: hidden;
+    }
+    /* 中间层分割容器：也是 grid，轨道同样由求解结果写成显式 px */
+    .split { display: grid; gap: 0; min-width: 0; min-height: 0; overflow: hidden; }
+    /* 分隔条：占一条轨道，拖动改变相邻两区尺寸、双击恢复默认比例。
+       这是「不用绝对定位也能把分隔条放在区域之间」的做法。 */
+    .splitter { background: #2a2f3a; border-radius: 2px; }
+    .splitter:hover, body.dragging .splitter { background: #3d63a3; }
+    .splitter-cols { cursor: col-resize; }
+    .splitter-rows { cursor: row-resize; }
+    body.dragging { user-select: none; }
+    /* 区域：强制裁剪 + 尺寸不随内容变化 */
+    .region {
+      display: flex; flex-direction: column;
+      min-width: 0; min-height: 0; overflow: hidden;
+      border: 1px solid #2a2f3a; border-radius: 4px; background: #171a20;
+    }
+    /* ── [hidden] 的特异性陷阱（F1 根因，G15 实测抓到的真缺陷）─────────────────
+       UA 样式表里有 `[hidden] { display: none }`，特异性是 (0,1,0)；
+       而 `.region { display: flex }` 的特异性**同样**是 (0,1,0)。
+       特异性相同时**作者样式优先于 UA 样式**，所以 `el.hidden = true`
+       只隐藏了语义（无障碍树），**布局上依然是 grid item**：
+       求解器已经按可见性删掉了这个孩子的轨道，DOM 却还占一个轨道位 ⇒
+       **轨道与孩子错位一位**，末尾孩子掉进隐式 `auto` 轨道、塌成几像素
+       （实测：rx 高 8px、events 内容高度 0、内容越界）。
+       因此必须用**特异性更高**的规则把隐藏项真正从布局里拿掉：
+       `.region[hidden]` = (0,2,0) > (0,1,0)；`.split[hidden]` / `.splitter[hidden]` 同理兜底。
+       —— 这条规则别删；闸门里有一条按特异性算的断言盯着它。 */
+    .region[hidden], .split[hidden], .splitter[hidden] { display: none; }
+    .region > .region-head {
+      flex: 0 0 auto; display: flex; gap: 6px; align-items: center;
+      padding: 4px 8px; background: #1c2027; font-size: 12px; color: #9aa4b2;
+    }
+    .region > .region-body {
+      flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; padding: 6px 8px;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .region-body > .row, .region-body > .block, .region-body > h1 { flex: 0 0 auto; min-width: 0; }
+    h1 { font-size: 14px; font-weight: 600; margin: 0 0 2px; color: #8ab4f8; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .block { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid #23262e; padding-top: 6px; }
+    .block > .block-title { font-size: 12px; color: #9aa4b2; }
+    .block > .row { flex: 0 0 auto; }
     button {
       background: #2a2f3a; color: #d7dae0; border: 1px solid #3c4350;
-      padding: 6px 12px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 13px;
+      padding: 5px 10px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 13px;
     }
     button:hover:not(:disabled) { background: #353b48; }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
     button.primary { background: #2b4a7d; border-color: #3d63a3; }
     button.danger { background: #5a2b2b; border-color: #8d4040; }
+    button.tiny { padding: 1px 6px; font-size: 11px; }
     select, input {
       background: #1c2027; color: #d7dae0; border: 1px solid #3c4350;
-      padding: 6px; border-radius: 4px; font: inherit; font-size: 13px;
+      padding: 5px; border-radius: 4px; font: inherit; font-size: 13px;
     }
     select:disabled, input:disabled { opacity: 0.55; cursor: not-allowed; }
-    #port { min-width: 230px; }
-    #baud { width: 96px; }
-    #timedInterval { width: 84px; }
-    #txInput { flex: 1 1 auto; min-width: 180px; }
+    #port { min-width: 200px; }
+    #baud { width: 90px; }
+    #timedInterval { width: 74px; }
+    #txInput, #repoPath, #binPath, #sessionsRoot { flex: 1 1 auto; min-width: 120px; }
     label { font-size: 12.5px; color: #9aa4b2; display: inline-flex; gap: 4px; align-items: center; }
-    fieldset {
-      border: 1px solid #2a2f3a; border-radius: 4px; margin: 0; padding: 8px 10px;
-      display: flex; flex-direction: column; gap: 8px;
-      min-width: 0;   /* 长内容不许把面板顶宽（横轴同理） */
-    }
-    /* A 类面板：内容固定，禁止收缩。 */
-    fieldset.fixed { flex: 0 0 auto; }
-    /* B 类面板：唯一的伸缩区，必须能缩到内容高度以下。 */
-    fieldset.pane { flex: 1 1 auto; min-height: 0; }
-    legend { font-size: 12px; color: #9aa4b2; padding: 0 4px; }
+    /* 接收区/事件区的内容容器（由区域 API 创建，见 JS） */
     #rx {
-      background: #0e1014; border: 1px solid #2a2f3a; border-radius: 4px;
-      padding: 8px; font-size: 12.5px; line-height: 1.45;
-      /* 接收区自己滚：flex: 1 1 auto 吃掉 .pane 的剩余高度；
-         min-height: 0 让它能缩得比内容矮（否则 overflow 永不生效）；
-         不许写 min-height: <数字>px —— 那会把下方区域顶出窗口。 */
-      flex: 1 1 auto; min-height: 0; min-width: 0; overflow: auto;
-      /* 长行只在本框内换行/滚动，不撑宽页面。 */
-      white-space: pre-wrap; overflow-wrap: anywhere;
-      user-select: text;
+      flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto;
+      background: #0e1014; border: 1px solid #2a2f3a; border-radius: 4px; padding: 8px;
+      font-size: 12.5px; line-height: 1.45; white-space: pre-wrap;
+      overflow-wrap: anywhere; user-select: text;
     }
     #log {
-      background: #0e1014; border: 1px solid #2a2f3a; border-radius: 4px;
-      padding: 6px 8px; flex: 0 0 auto; height: 96px; overflow: auto;
+      flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto;
+      background: #0e1014; border: 1px solid #2a2f3a; border-radius: 4px; padding: 6px 8px;
       font-size: 12px; line-height: 1.5; overflow-wrap: anywhere;
     }
-    .ok { color: #7ee787; }
-    .err { color: #ff7b72; }
-    .dim { color: #6e7681; }
-    .warn { color: #e3b341; }
-    #counters { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; }
+    #counters { display: flex; gap: 14px; flex-wrap: wrap; font-size: 13px; }
     #counters b { color: #8ab4f8; font-size: 15px; }
     #status { padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #2a2f3a; }
     #status.on { background: #1f4d2b; color: #9be8a8; }
-    #paramsHint { font-size: 12px; color: #6e7681; }
+    #fpHint { font-size: 12px; color: #e3b341; overflow-wrap: anywhere; }
+    #fpHint.ok { color: #7ee787; }
+    #fpHint b { color: #ff7b72; }
+    #fpHint.ok b { color: #7ee787; }
+    #fpStatus { font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    #fpStatus.ok { color: #7ee787; }
+    #fpStatus.warn { color: #e3b341; }
+    #fpStatus .fp-commit, .commit { color: #8ab4f8; user-select: text; }
+    #fpStatus .missing, .missing { color: #e3b341; }
+    .dim { color: #6e7681; font-size: 12px; }
+    .ok { color: #7ee787; }
+    .err { color: #ff7b72; }
+    .warn { color: #e3b341; }
+    .reason { color: #e3b341; }
+    #paramsHint, .hint { font-size: 12px; color: #6e7681; }
+    /* 日志列表浮层：#app 之外的固定定位层（不参与网格分配，也就不会挤压区域） */
+    .overlay {
+      position: fixed; inset: 0; z-index: 100; display: none;
+      background: #000a; align-items: center; justify-content: center;
+    }
+    .overlay.open { display: flex; }
+    #sessionsPanel {
+      width: min(1000px, 94vw); max-height: 88vh; display: flex; flex-direction: column; gap: 8px;
+      background: #181b21; border: 1px solid #3c4350; border-radius: 6px; padding: 12px;
+    }
+    #sessionList { overflow: auto; max-height: 58vh; display: flex; flex-direction: column; gap: 6px; }
+    .session-item { border: 1px solid #2a2f3a; border-radius: 4px; padding: 6px 8px; font-size: 12.5px; }
+    .session-item .head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .session-item .fp { color: #9aa4b2; margin-top: 4px; overflow-wrap: anywhere; }
+    .session-item.broken { border-color: #8d4040; }
+    #sessionList .empty { color: #6e7681; padding: 8px; }
+    /* 布局自检报告：固定定位覆盖层，**只测量不改布局** */
+    #selftestReport {
+      position: fixed; inset: 0; z-index: 200; display: none; background: #000c;
+      align-items: flex-start; justify-content: center; padding: 20px;
+    }
+    #selftestReport.open { display: flex; }
+    #selftestPanel {
+      width: min(1100px, 96vw); max-height: 92vh; overflow: auto; background: #181b21;
+      border: 1px solid #3c4350; border-radius: 6px; padding: 12px; font-size: 12.5px;
+    }
+    #selftestPanel pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow: auto; }
+    #selftestVerdict { font-size: 16px; font-weight: 600; }
+    #selftestVerdict.pass { color: #7ee787; }
+    #selftestVerdict.fail { color: #ff7b72; }
   </style>
 </head>
 
 <body>
-  <h1>embhub — 串口助手（会话：源 + 落盘 + 发送）</h1>
+  <!-- 布局根：四个区域由注册表创建在这里（左列 params，右列 tx/rx/events 纵向） -->
+  <div id="app"></div>
 
-  <!-- ① 刷新并列出端口  ② 端口与波特率  ③ 打开/关闭会话 -->
-  <div class="row">
-    <button id="refresh">刷新端口</button>
-    <select id="port" title="串口列表来自 core 的 list_ports()"></select>
-    <label>波特率 <input id="baud" list="bauds" value="115200" /></label>
-    <datalist id="bauds">
-      <option>9600</option><option>19200</option><option>38400</option><option>57600</option>
-      <option>115200</option><option>230400</option><option>460800</option><option>921600</option>
-    </datalist>
+  <!-- 区域内容源：控件仍然声明在 HTML 里（可读性 + id 稳定），
+       但**容器**由注册表创建，初始化时把这里的内容搬进去 —— 见 JS 的 adoptDeclaredContent()。 -->
+  <template id="region-sources">
+    <!-- 参数区（左列）：串口 / 帧参数 / 打开关闭 / 仓库·bin / 计数 / 布局 / 日志入口 -->
+    <section data-region="params">
+      <h1>embhub — 串口助手</h1>
+      <div class="block">
+        <div class="block-title">串口</div>
+        <div class="row">
+          <button id="refresh">刷新端口</button>
+          <select id="port" title="串口列表来自 core 的 list_ports()"></select>
+        </div>
+        <div class="row">
+          <label>波特率 <input id="baud" list="bauds" value="115200" /></label>
+          <datalist id="bauds">
+            <option>9600</option><option>19200</option><option>38400</option><option>57600</option>
+            <option>115200</option><option>230400</option><option>460800</option><option>921600</option>
+          </datalist>
+        </div>
+        <div class="row">
+          <label>数据位
+            <select id="dataBits">
+              <option value="8" selected>8</option>
+              <option value="7">7</option>
+              <option value="6">6</option>
+              <option value="5">5</option>
+            </select>
+          </label>
+          <label>校验
+            <select id="parity">
+              <option value="none" selected>None</option>
+              <option value="odd">Odd</option>
+              <option value="even">Even</option>
+            </select>
+          </label>
+          <label>停止位
+            <select id="stopBits">
+              <!-- 只给 1 与 2：serialport 4.x 没有 1.5 停止位，列出来等于给用户一个必然报错的选项 -->
+              <option value="1" selected>1</option>
+              <option value="2">2</option>
+            </select>
+          </label>
+          <label>流控
+            <select id="flowControl">
+              <option value="none" selected>None</option>
+              <option value="rtscts">RTS/CTS</option>
+              <option value="xonxoff">XON/XOFF</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <button id="open" class="primary">打开会话</button>
+          <button id="close" class="danger" disabled>关闭会话</button>
+          <span id="status">未连接</span>
+        </div>
+        <div id="paramsHint">运行中不可改参数：改参数 = 关闭后重新打开新会话（避免「界面显示 115200、实际跑 9600」这类误导）。</div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">固件指纹（选填，只读采集）</div>
+        <div class="row">
+          <label>仓库路径 <input id="repoPath" placeholder="C:\work\my-firmware —— 填了才采集指纹" /></label>
+        </div>
+        <div class="row">
+          <label>bin 文件 <input id="binPath" placeholder="out\fw.elf（填了才有 bin_hash）" /></label>
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">本次会话</div>
+        <div id="counters">
+          <span>RX <b id="rxBytes">0</b></span>
+          <span>TX <b id="txBytes">0</b></span>
+          <span>显示丢弃 <b id="dropBytes">0</b></span>
+        </div>
+        <div class="dim" id="extra"></div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">区域（开关与比例，自动记住）</div>
+        <!-- 这里是**统一的「重新打开」入口**：四个区域全部列出（由区域表驱动），
+             关掉的区域可以从这里勾回来；常驻区域禁用并说明原因。 -->
+        <div class="row" id="regionToggles"></div>
+        <div class="row" id="layoutRatios"></div>
+        <div class="row">
+          <button id="layoutReset">恢复默认布局</button>
+          <button id="runSelftest">跑布局自检</button>
+        </div>
+        <div class="dim">区域尺寸由 layout.js 求解成 Grid 轨道：每层先扣最小值，剩余按权重分；
+          关掉区域后兄弟吃掉它的空间；拖分隔条等量反向调整相邻两区，双击分隔条恢复默认比例。</div>
+      </div>
+
+      <div class="block">
+        <div class="block-title">日志</div>
+        <div class="row">
+          <button id="listSessions">日志列表（含指纹）</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 发送区 -->
+    <section data-region="tx">
+      <div class="row">
+        <select id="txMode">
+          <option value="text">文本</option>
+          <option value="hex">HEX</option>
+        </select>
+        <select id="txAppend">
+          <option value="none">不追加</option>
+          <option value="cr">追加 CR</option>
+          <option value="lf">追加 LF</option>
+          <option value="crlf">追加 CRLF</option>
+        </select>
+        <input id="txInput" placeholder="文本模式直接输；HEX 模式输 AA55FF（可带空格）" />
+        <button id="send" class="primary" disabled>发送</button>
+      </div>
+      <div class="row">
+        <label>定时发送间隔 <input id="timedInterval" value="1000" /> ms</label>
+        <button id="timedStart" disabled>开始定时</button>
+        <button id="timedStop" disabled>停止定时</button>
+        <span class="dim" id="timedStatus">定时发送未运行</span>
+      </div>
+      <div class="dim">定时发送与手动发送共用同一套 mode/append 解析；关会话会自动停掉定时器。Enter 亦可发送。</div>
+    </section>
+
+    <!-- 接收区 -->
+    <section data-region="rx">
+      <div class="row">
+        <label><input type="radio" name="view" value="text" checked /> 文本</label>
+        <label><input type="radio" name="view" value="hex" /> HEX</label>
+        <label><input type="checkbox" id="showTs" /> 时间戳（墙上时钟，毫秒）</label>
+        <button id="clear">清空</button>
+        <label><input type="checkbox" id="autoscroll" checked /> 自动滚动</label>
+        <span class="dim">显示区只保留最近 256 KiB；落盘与计数不受影响</span>
+      </div>
+    </section>
+
+    <!-- 事件与错误 -->
+    <section data-region="events">
+      <div class="dim">失败原因、致命错误、定时发送状态都在这里；内容走区域 API 写入。</div>
+    </section>
+  </template>
+
+  <!-- 日志列表浮层（固定定位，不参与网格分配） -->
+  <div id="sessionsOverlay" class="overlay">
+    <div id="sessionsPanel">
+      <div class="row">
+        <b>日志列表（会话 ↔ 固件指纹）</b>
+        <span style="flex:1 1 auto"></span>
+        <button id="sessionsClose">关闭</button>
+      </div>
+      <div class="row">
+        <label>sessions 目录 <input id="sessionsRoot" placeholder="留空 = 程序数据目录下的 sessions" /></label>
+        <button id="sessionsRefresh" class="primary">刷新列表</button>
+        <span class="dim" id="listStatus">尚未加载</span>
+      </div>
+      <div id="sessionList"></div>
+      <div class="dim">
+        指纹与磁盘会话头逐字一致（<code>collected</code> / <code>not_collected</code>，字段值为
+        <code>{Value|Missing}</code>）：未采集会显示<b>原因</b>，采集不到某字段也显示<b>原文原因</b>。
+        本页只读日志，不执行任何 git 写操作。
+      </div>
+    </div>
   </div>
 
-  <!-- 帧格式四件套：数据位 / 校验位 / 停止位 / 流控 -->
-  <div class="row">
-    <label>数据位
-      <select id="dataBits">
-        <option value="8" selected>8</option>
-        <option value="7">7</option>
-        <option value="6">6</option>
-        <option value="5">5</option>
-      </select>
-    </label>
-    <label>校验位
-      <select id="parity">
-        <option value="none" selected>None</option>
-        <option value="odd">Odd</option>
-        <option value="even">Even</option>
-      </select>
-    </label>
-    <label>停止位
-      <select id="stopBits">
-        <!-- 只给 1 与 2：serialport 4.x 没有 1.5 停止位，列出来等于给用户一个必然报错的选项 -->
-        <option value="1" selected>1</option>
-        <option value="2">2</option>
-      </select>
-    </label>
-    <label>流控
-      <select id="flowControl">
-        <option value="none" selected>None</option>
-        <option value="rtscts">RTS/CTS</option>
-        <option value="xonxoff">XON/XOFF</option>
-      </select>
-    </label>
-    <button id="open" class="primary">打开会话</button>
-    <button id="close" class="danger" disabled>关闭会话</button>
-    <span id="status">未连接</span>
-  </div>
-  <div id="paramsHint">运行中不可改参数：改参数 = 关闭后重新打开新会话（避免「界面显示 115200、实际跑 9600」这类误导）。</div>
-
-  <!-- 三个计数 -->
-  <div id="counters">
-    <span>RX 字节 <b id="rxBytes">0</b></span>
-    <span>TX 字节 <b id="txBytes">0</b></span>
-    <span>显示丢弃字节 <b id="dropBytes">0</b></span>
-    <span class="dim" id="extra"></span>
+  <!-- 布局自检报告（?selftest=1 或点「跑布局自检」） -->
+  <div id="selftestReport">
+    <div id="selftestPanel">
+      <div class="row">
+        <b>布局不变量自检</b>
+        <span id="selftestVerdict"></span>
+        <span style="flex:1 1 auto"></span>
+        <button id="selftestCopy">复制 JSON</button>
+        <button id="selftestClose">关闭</button>
+      </div>
+      <div id="selftestSummary" class="dim"></div>
+      <pre id="selftestJson"></pre>
+    </div>
   </div>
 
-  <!-- 接收区：文本/HEX、时间戳、清空、自动滚动 -->
-  <!-- 接收区：唯一伸缩的面板（class="pane"），内部 #rx 自己滚动 -->
-  <fieldset class="pane" id="rxPane">
-    <legend>接收区</legend>
-    <div class="row">
-      <label><input type="radio" name="view" value="text" checked /> 文本</label>
-      <label><input type="radio" name="view" value="hex" /> HEX</label>
-      <label><input type="checkbox" id="showTs" /> 显示时间戳（墙上时钟，毫秒）</label>
-      <button id="clear">清空</button>
-      <label><input type="checkbox" id="autoscroll" checked /> 自动滚动</label>
-      <span class="dim" id="rxHint">显示区只保留最近 256 KiB；落盘与计数不受影响</span>
-    </div>
-    <div id="rx"></div>
-  </fieldset>
-
-  <!-- 发送区：固定内容面板（class="fixed"，永不收缩，防止被接收区挤扁） -->
-  <fieldset class="fixed" id="txPane">
-    <legend>发送区</legend>
-    <div class="row">
-      <select id="txMode">
-        <option value="text">文本</option>
-        <option value="hex">HEX</option>
-      </select>
-      <select id="txAppend">
-        <option value="none">不追加</option>
-        <option value="cr">追加 CR</option>
-        <option value="lf">追加 LF</option>
-        <option value="crlf">追加 CRLF</option>
-      </select>
-      <input id="txInput" placeholder="文本模式直接输；HEX 模式输 AA55FF（可带空格）" />
-      <button id="send" class="primary" disabled>发送</button>
-      <span class="dim">Enter 亦可发送</span>
-    </div>
-    <div class="row">
-      <label>定时发送间隔 <input id="timedInterval" value="1000" /> ms</label>
-      <button id="timedStart" disabled>开始定时</button>
-      <button id="timedStop" disabled>停止定时</button>
-      <span class="dim" id="timedStatus">定时发送未运行</span>
-    </div>
-    <div class="dim">
-      定时发送与手动发送共用同一套 mode/append 解析（字节完全一致）；关闭会话会自动停掉定时器。
-    </div>
-  </fieldset>
-
-  <!-- 事件与错误：同样是固定内容面板（永不收缩） -->
-  <fieldset class="fixed" id="logPane">
-    <legend>事件与错误（失败原因都在这里）</legend>
-    <div id="log"></div>
-  </fieldset>
-
+  <!-- 布局内核：纯函数、零依赖，Node 也能跑（node ui/layout.test.js） -->
+  <script src="layout.js"></script>
   <script>
-    const invoke = window.__TAURI__.core.invoke;
-    const { listen } = window.__TAURI__.event;
+    // =====================================================================
+    // 0. 布局内核引用（**唯一来源**：页面不复制区域表、不自己算尺寸）
+    // =====================================================================
+    const L = window.embhubLayout;
+    const { REGIONS, REGION_ORDER, TREE, solve, normalizeState, serializeState } = L;
 
-    // ---- DOM ----
-    const portEl = document.getElementById("port");
-    const baudEl = document.getElementById("baud");
-    const dataBitsEl = document.getElementById("dataBits");
-    const parityEl = document.getElementById("parity");
-    const stopBitsEl = document.getElementById("stopBits");
-    const flowControlEl = document.getElementById("flowControl");
-    const openBtn = document.getElementById("open");
-    const closeBtn = document.getElementById("close");
-    const sendBtn = document.getElementById("send");
-    const statusEl = document.getElementById("status");
-    const rxEl = document.getElementById("rx");
-    const logEl = document.getElementById("log");
-    const rxBytesEl = document.getElementById("rxBytes");
-    const txBytesEl = document.getElementById("txBytes");
-    const dropBytesEl = document.getElementById("dropBytes");
-    const extraEl = document.getElementById("extra");
-    const txInput = document.getElementById("txInput");
-    const txMode = document.getElementById("txMode");
-    const txAppend = document.getElementById("txAppend");
-    const autoscrollEl = document.getElementById("autoscroll");
-    const showTsEl = document.getElementById("showTs");
-    const timedIntervalEl = document.getElementById("timedInterval");
-    const timedStartBtn = document.getElementById("timedStart");
-    const timedStopBtn = document.getElementById("timedStop");
-    const timedStatusEl = document.getElementById("timedStatus");
+    // Tauri 可选：普通浏览器里也能加载（布局自检不需要后端，必须能脱开 Tauri 跑）
+    const TAURI = window.__TAURI__ || null;
+    const invoke = TAURI
+      ? TAURI.core.invoke
+      : async (cmd) => { throw new Error(`不在 Tauri 环境里：${cmd} 不可用（布局自检不需要后端）`); };
+    const listen = TAURI ? TAURI.event.listen : async () => () => {};
 
-    // ---- 状态 ----
+    const STORAGE_KEY = "embhub.layout.v1";
+
+    // ---- 持久化：localStorage 里的东西不可信，一律过 normalizeState（坏数据回退默认） ----
+    function loadState() {
+      let raw = null;
+      try { raw = localStorage.getItem(STORAGE_KEY); } catch (e) { raw = null; }
+      return normalizeState(raw);
+    }
+    function saveState() {
+      try { localStorage.setItem(STORAGE_KEY, serializeState(state)); } catch (e) { /* 存不了不影响布局 */ }
+    }
+    let state = loadState();
+
+    // =====================================================================
+    // 1. 区域注册表 → DOM：**容器由注册表创建**；内容只能通过 regions.get(id) 写
+    // =====================================================================
+    const appEl = document.getElementById("app");
+    // 控件取值/事件一律用 document.getElementById 取一次（**内容**一律写进区域 API 给的容器）
+    const regions = new Map(); // id -> { def, el, head, body }
+    const nodes = new Map();   // 树节点 id -> DOM（区域元素或分割容器）
+
+    function createRegion(def) {
+      const el = document.createElement("div");
+      el.className = "region";
+      el.dataset.regionId = def.id;
+      const head = document.createElement("div");
+      head.className = "region-head";
+      const title = document.createElement("span");
+      title.textContent = def.title;
+      head.appendChild(title);
+      const minTag = document.createElement("span");
+      minTag.className = "dim";
+      minTag.style.marginLeft = "auto";
+      minTag.textContent = `≥${def.minW}×${def.minH}`;
+      head.appendChild(minTag);
+      if (def.closable) {
+        const btn = document.createElement("button");
+        btn.className = "tiny";
+        btn.textContent = "×";
+        btn.title = "关闭该区域（布局会记住；可从参数区重新打开）";
+        btn.addEventListener("click", () => setVisible(def.id, false));
+        head.appendChild(btn);
+      }
+      const body = document.createElement("div");
+      body.className = "region-body";
+      el.appendChild(head);
+      el.appendChild(body);
+      const region = { def, el, head, body };
+      regions.set(def.id, region);
+      return region;
+    }
+
+    /**
+     * 按分割树建 DOM。**根节点就是 `#app` 自己**（不再多套一层 `.split` ——
+     * 多套一层就要求 `#app` 自己的模板与「唯一孩子」匹配，那正是 RC1 那个
+     * 「静态两列模板 vs 单孩子」矛盾的来源）。这样子节点直接铺在 `#app` 里，
+     * `applyLayout()` 写 `tracks[root]` 就是写 `#app` 的模板，结构永远自洽。
+     */
+    function buildLayoutDom(node, host, isRoot) {
+      if (node.kind === "leaf") {
+        const r = createRegion(REGIONS[node.region]);
+        nodes.set(node.id, r.el);
+        host.appendChild(r.el);
+        return;
+      }
+      const box = isRoot ? host : document.createElement("div");
+      nodes.set(node.id, box);
+      box.dataset.splitNode = node.id;
+      if (!isRoot) {
+        box.className = "split split-" + node.kind;
+        host.appendChild(box);
+      }
+      for (const child of node.children) buildLayoutDom(child, box, false);
+    }
+
+    /** 把 HTML 里声明的控件搬进注册表创建的容器（容器的归属仍然是注册表）。 */
+    function adoptDeclaredContent() {
+      const tpl = document.getElementById("region-sources");
+      const sources = tpl ? Array.from(tpl.content.querySelectorAll("[data-region]")) : [];
+      for (const src of sources) {
+        const region = regions.get(src.dataset.region);
+        if (!region) continue;
+        while (src.firstChild) region.body.appendChild(src.firstChild);
+      }
+      if (tpl) tpl.remove();
+    }
+
+    buildLayoutDom(TREE, appEl, true);
+    adoptDeclaredContent();
+
+    // ---- 内容容器（业务内容一律写到这里，不再用 getElementById 抓内容节点） ----
+    const rxEl = document.createElement("div");
+    rxEl.id = "rx";
+    regions.get("rx").body.appendChild(rxEl);
+
+    const logEl = document.createElement("div");
+    logEl.id = "log";
+    regions.get("events").body.appendChild(logEl);
+
+    const fpHintEl = document.createElement("div");
+    fpHintEl.id = "fpHint";
+    regions.get("params").body.appendChild(fpHintEl);
+
+    const fpStatusEl = document.createElement("div");
+    fpStatusEl.id = "fpStatus";
+    regions.get("params").body.appendChild(fpStatusEl);
+
+    const sessionListEl = document.createElement("div");
+    document.getElementById("sessionList").appendChild(sessionListEl);
+
+    // =====================================================================
+    // 2. 应用尺寸：求解 → 写显式 Grid 轨道（含分隔条轨道）+ #app 的最小尺寸
+    // =====================================================================
+    let lastSolve = null;
+    const splitterEls = new Map(); // 容器节点 id -> [分隔条元素]
+
+    /** 把解出的孩子尺寸写成「孩子, 间隙, 孩子, 间隙…」的显式轨道（间隙轨道用来放分隔条）。 */
+    function trackCss(track) {
+      const parts = [];
+      track.sizes.forEach((s, i) => {
+        if (i > 0) parts.push((track.gap || 0).toFixed(2) + "px");
+        parts.push(s.toFixed(2) + "px");
+      });
+      return parts.join(" ");
+    }
+
+    function solveNow() {
+      return L.solve({
+        size: { width: appEl.clientWidth, height: appEl.clientHeight },
+        visible: state.visible,
+        ratios: state.ratios,
+        sizes: state.sizes,
+      });
+    }
+
+    /**
+     * 给容器重建分隔条：**只在相邻的两个可见孩子之间**插一条。
+     *
+     * 由区域表/树驱动（不是硬编码哪几个按钮）：容器有几个可见孩子就有 `n-1` 条分隔条，
+     * 下标就是该容器**可见孩子列表**里的位置——拖拽时原样交回 `L.resizePair`。
+     */
+    function rebuildSplitters(node) {
+      const host = nodes.get(node.id);
+      if (!host) return;
+      (splitterEls.get(node.id) || []).forEach((el) => el.remove());
+      const kids = L.visibleChildren(node, state.visible, REGIONS);
+      const fresh = [];
+      kids.forEach((kid, i) => {
+        host.appendChild(nodes.get(kid.id)); // appendChild 是「搬」：顺手把顺序排成与轨道一致
+        if (i < kids.length - 1) {
+          const sp = makeSplitter(node, i);
+          host.appendChild(sp);
+          fresh.push(sp);
+        }
+      });
+      splitterEls.set(node.id, fresh);
+    }
+
+    function makeSplitter(node, index) {
+      const sp = document.createElement("div");
+      sp.className = "splitter splitter-" + node.kind;
+      sp.dataset.splitNode = node.id;
+      sp.dataset.splitIndex = String(index);
+      sp.setAttribute("role", "separator");
+      sp.title = (node.kind === "cols" ? "拖动调整左右宽度" : "拖动调整上下高度")
+        + "（等量反向、到极限停住；双击恢复默认比例）";
+      sp.addEventListener("dblclick", () => resetContainer(node.id));
+      sp.addEventListener(DRAG.down, (ev) => startDrag(ev, sp, node, index));
+      return sp;
+    }
+
+    function applyLayout() {
+      let size = { width: appEl.clientWidth, height: appEl.clientHeight };
+      let res = solve({ size: size, visible: state.visible, ratios: state.ratios, sizes: state.sizes });
+      // 尺寸与最小尺寸互相影响（设了 min-* 会改变实际可用尺寸），迭代到稳定为止。
+      for (let i = 0; i < 4; i += 1) {
+        appEl.style.minWidth = res.minSize.width + "px";
+        appEl.style.minHeight = res.minSize.height + "px";
+        const next = { width: appEl.clientWidth, height: appEl.clientHeight };
+        if (next.width === size.width && next.height === size.height) break;
+        size = next;
+        res = solve({ size: size, visible: state.visible, ratios: state.ratios, sizes: state.sizes });
+      }
+      for (const nodeId of Object.keys(res.tracks)) {
+        const el = nodes.get(nodeId);
+        if (!el) continue;
+        const track = res.tracks[nodeId];
+        const px = trackCss(track);
+        if (track.kind === "cols") el.style.gridTemplateColumns = px;
+        else el.style.gridTemplateRows = px;
+      }
+      for (const id of REGION_ORDER) {
+        const region = regions.get(id);
+        if (region) region.el.hidden = !state.visible[id];
+      }
+      // 分隔条只在相邻的可见孩子之间出现，且轨道已按「孩子/间隙」交错 → 必须同步重建
+      for (const nodeId of Object.keys(res.tracks)) {
+        rebuildSplitters(L.findNode(TREE, nodeId));
+      }
+      lastSolve = res;
+      return res;
+    }
+
+    /** 关/开某个区域。返回 `{ok, reason}`：**拒绝时说明原因**，界面原样显示。 */
+    function setVisible(id, on) {
+      const def = REGIONS[id];
+      if (!def) return { ok: false, reason: "未知区域: " + id };
+      if (!on) {
+        const verdict = L.canHide(state.visible, id, REGIONS);
+        if (!verdict.ok) {
+          log("不能关闭「" + def.title + "」：" + verdict.reason, "warn");
+          syncRegionToggles();
+          return verdict;
+        }
+      }
+      state = L.normalizeState({
+        visible: Object.assign({}, state.visible, { [id]: !!on }),
+        ratios: state.ratios,
+        sizes: state.sizes,
+      });
+      saveState();
+      syncRegionToggles();
+      applyLayout();
+      return { ok: true, reason: "" };
+    }
+
+    function setRatio(id, value) {
+      state = L.normalizeState({
+        visible: state.visible,
+        ratios: Object.assign({}, state.ratios, { [id]: value }),
+        sizes: state.sizes,
+      });
+      saveState();
+      applyLayout();
+    }
+
+    // ---- 分隔条拖拽（等量反向 + 双侧最小值 clamp，到极限停住）----
+    // 指针事件优先（Chromium 都有），拿不到就退回鼠标事件 —— harness 用同一套事件驱动。
+    const DRAG = (typeof PointerEvent !== "undefined")
+      ? { down: "pointerdown", move: "pointermove", up: "pointerup", cancel: "pointercancel", isPointer: true }
+      : { down: "mousedown", move: "mousemove", up: "mouseup", cancel: "mouseleave", isPointer: false };
+    let dragging = null;
+
+    function startDrag(ev, sp, node, index) {
+      if (dragging) return;
+      ev.preventDefault();
+      const axis = L.axisOf(node);
+      const track = solveNow().tracks[node.id];
+      if (!track) return;
+      dragging = {
+        nodeId: node.id,
+        index: index,
+        axis: axis,
+        start: axis === "w" ? ev.clientX : ev.clientY,
+        size: { width: appEl.clientWidth, height: appEl.clientHeight },
+        baseSizes: Object.assign({}, state.sizes), // 以「按下那一刻」为基准，避免逐帧漂移
+        startSizes: track.sizes.slice(),
+        moved: false,
+      };
+      window.addEventListener(DRAG.move, onDragMove);
+      window.addEventListener(DRAG.up, endDrag);
+      if (DRAG.cancel) window.addEventListener(DRAG.cancel, endDrag);
+      document.body.classList.add("dragging");
+      try {
+        if (DRAG.isPointer && sp.setPointerCapture && ev.pointerId != null) sp.setPointerCapture(ev.pointerId);
+      } catch (e) { /* 合成事件没有真实 pointerId：忽略 */ }
+    }
+
+    function onDragMove(ev) {
+      if (!dragging) return;
+      ev.preventDefault();
+      const cur = dragging.axis === "w" ? ev.clientX : ev.clientY;
+      const res = L.resizePair({
+        size: dragging.size,
+        visible: state.visible,
+        ratios: state.ratios,
+        sizes: dragging.baseSizes,
+        splitNodeId: dragging.nodeId,
+        index: dragging.index,
+        deltaPx: cur - dragging.start,
+      });
+      dragging.moved = true;
+      dragging.applied = res.applied;
+      state = L.normalizeState({ visible: state.visible, ratios: state.ratios, sizes: res.sizes });
+      applyLayout();
+    }
+
+    function endDrag() {
+      if (!dragging) return;
+      window.removeEventListener(DRAG.move, onDragMove);
+      window.removeEventListener(DRAG.up, endDrag);
+      if (DRAG.cancel) window.removeEventListener(DRAG.cancel, endDrag);
+      document.body.classList.remove("dragging");
+      const moved = dragging.moved;
+      dragging = null;
+      if (moved) {
+        saveState(); // 每次交互后持久化
+        log("已调整区域尺寸（双击分隔条可恢复默认比例）", "dim");
+      }
+    }
+
+    /** 双击分隔条：清掉该容器孩子的钉住尺寸 → 回到出厂比例。 */
+    function resetContainer(nodeId) {
+      const node = L.findNode(TREE, nodeId);
+      if (!node) return;
+      const next = Object.assign({}, state.sizes);
+      for (const kid of node.children) {
+        delete next[kid.id];
+        if (kid.region) delete next[kid.region];
+      }
+      state = L.normalizeState({ visible: state.visible, ratios: state.ratios, sizes: next });
+      saveState();
+      applyLayout();
+      log("已恢复该分隔条的默认比例", "dim");
+    }
+
+    // =====================================================================
+    // 3. 控件引用（只用于取值/事件）+ 布局控件（可见性 + 比例）
+    // =====================================================================
+    const ui = {
+      refresh: document.getElementById("refresh"), port: document.getElementById("port"), baud: document.getElementById("baud"),
+      dataBits: document.getElementById("dataBits"), parity: document.getElementById("parity"), stopBits: document.getElementById("stopBits"),
+      flowControl: document.getElementById("flowControl"), open: document.getElementById("open"), close: document.getElementById("close"),
+      status: document.getElementById("status"), repoPath: document.getElementById("repoPath"), binPath: document.getElementById("binPath"),
+      rxBytes: document.getElementById("rxBytes"), txBytes: document.getElementById("txBytes"), dropBytes: document.getElementById("dropBytes"),
+      extra: document.getElementById("extra"), regionToggles: document.getElementById("regionToggles"), layoutRatios: document.getElementById("layoutRatios"),
+      layoutReset: document.getElementById("layoutReset"), runSelftest: document.getElementById("runSelftest"),
+      listSessions: document.getElementById("listSessions"), txMode: document.getElementById("txMode"), txAppend: document.getElementById("txAppend"),
+      txInput: document.getElementById("txInput"), send: document.getElementById("send"), timedInterval: document.getElementById("timedInterval"),
+      timedStart: document.getElementById("timedStart"), timedStop: document.getElementById("timedStop"), timedStatus: document.getElementById("timedStatus"),
+      showTs: document.getElementById("showTs"), autoscroll: document.getElementById("autoscroll"), clear: document.getElementById("clear"),
+      sessionsOverlay: document.getElementById("sessionsOverlay"), sessionsClose: document.getElementById("sessionsClose"),
+      sessionsRoot: document.getElementById("sessionsRoot"), sessionsRefresh: document.getElementById("sessionsRefresh"),
+      listStatus: document.getElementById("listStatus"), selftestReport: document.getElementById("selftestReport"),
+      selftestVerdict: document.getElementById("selftestVerdict"), selftestSummary: document.getElementById("selftestSummary"),
+      selftestJson: document.getElementById("selftestJson"), selftestCopy: document.getElementById("selftestCopy"),
+      selftestClose: document.getElementById("selftestClose"),
+    };
+
+    /**
+     * 参数区里的「区域」块：**四个区域全部列出**（由区域表 `REGION_ORDER` 驱动，不是硬编码一组按钮）。
+     *
+     * 这就是统一的「重新打开」入口 —— 区域被关掉以后，从这里勾回来；
+     * 常驻区域（`closable: false`）的勾选框禁用并说明原因。
+     */
+    function syncRegionToggles() {
+      ui.regionToggles.textContent = "";
+      ui.layoutRatios.textContent = "";
+      for (const id of REGION_ORDER) {
+        const def = REGIONS[id];
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = !!state.visible[id];
+        box.disabled = !def.closable;
+        box.dataset.regionToggle = id; // harness 用真实 change 事件从这里「重新打开」
+        box.title = def.closable ? "勾选/取消即可显示或关闭该区域" : (def.title + " 是常驻区域，不可关闭");
+        box.addEventListener("change", () => setVisible(id, box.checked));
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(" " + def.title + (def.closable ? "" : "（常驻）")));
+        ui.regionToggles.appendChild(label);
+
+        if (def.weight > 0) {
+          const ratioLabel = document.createElement("label");
+          const input = document.createElement("input");
+          input.type = "number";
+          input.min = String(L.RATIO_MIN);
+          input.max = String(L.RATIO_MAX);
+          input.step = "0.25";
+          input.value = String(state.ratios[id]);
+          input.style.width = "70px";
+          input.addEventListener("change", () => setRatio(id, input.value));
+          ratioLabel.appendChild(document.createTextNode(def.title + " 比例 "));
+          ratioLabel.appendChild(input);
+          ui.layoutRatios.appendChild(ratioLabel);
+        }
+      }
+    }
+
+    // =====================================================================
+    // 4. 接收区渲染（内容写进区域 API 给的容器）
+    // =====================================================================
     let running = false;
     let lastFatal = null;
     let lastTxError = null;
     let lastTimedNote = null;
-    // 接收区保留的批次（用于切换 文本/HEX/时间戳 时重渲染）。只影响**显示**，不影响落盘与计数。
     const MAX_RENDER_BYTES = 256 * 1024;
     let chunks = []; // 每条：{ t_mono, wall_ms, bytes }
     let retained = 0;
@@ -263,13 +763,13 @@
       const line = document.createElement("div");
       if (cls) line.className = cls;
       const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-      line.textContent = `[${t}] ${msg}`;
+      line.textContent = "[" + t + "] " + msg;
       logEl.appendChild(line);
       logEl.scrollTop = logEl.scrollHeight;
     }
 
     const viewMode = () => document.querySelector('input[name="view"]:checked').value;
-    const showTimestamps = () => showTsEl.checked;
+    const showTimestamps = () => ui.showTs.checked;
     const hexOf = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
 
     function hexToBytes(hex) {
@@ -281,25 +781,23 @@
     /** 墙上时钟（epoch 毫秒，后端按会话创建点精确换算）→ 本地时间 HH:MM:SS.mmm。 */
     function fmtWall(ms) {
       const d = new Date(ms);
-      const p = (n, w = 2) => String(n).padStart(w, "0");
-      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+      const p = (n, w) => String(n).padStart(w == null ? 2 : w, "0");
+      return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()) + "." + p(d.getMilliseconds(), 3);
     }
 
-    /** 把一条批次渲染成文本（时间戳开关只影响这里）。 */
     function renderChunk(chunk, isFirstLine) {
       const body = viewMode() === "hex"
         ? hexOf(chunk.bytes)
         : new TextDecoder("utf-8", { fatal: false }).decode(chunk.bytes);
       if (!showTimestamps()) return body;
-      return `${isFirstLine ? "" : "\n"}[${fmtWall(chunk.wall_ms)}] ${body}`;
+      return (isFirstLine ? "" : "\n") + "[" + fmtWall(chunk.wall_ms) + "] " + body;
     }
 
     function appendText(text) {
       rxEl.appendChild(document.createTextNode(text));
-      if (autoscrollEl.checked) rxEl.scrollTop = rxEl.scrollHeight;
+      if (ui.autoscroll.checked) rxEl.scrollTop = rxEl.scrollHeight;
     }
 
-    /** 重渲染整个保留区（切模式 / 切时间戳 / 清空后用），顺带重置流式解码器。 */
     function rerender() {
       rxEl.textContent = "";
       streamDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -314,7 +812,7 @@
       chunks.push(chunk);
       retained += bytes.length;
       while (retained > MAX_RENDER_BYTES && chunks.length > 1) {
-        retained -= chunks.shift().bytes.length; // 只裁剪显示缓冲；计数与落盘不受影响
+        retained -= chunks.shift().bytes.length;
       }
       if (showTimestamps() || viewMode() === "hex") {
         appendText(renderChunk(chunk, wasEmpty));
@@ -323,29 +821,111 @@
       }
     }
 
-    // ---- 会话控制 ----
+    // =====================================================================
+    // 5. 固件指纹显示（键名与磁盘会话头一致：collected / not_collected / {Value|Missing}）
+    // =====================================================================
+    const fpValue = (f) => (f && Object.prototype.hasOwnProperty.call(f, "Value") ? f.Value : null);
+    const fpReason = (f) => (f && Object.prototype.hasOwnProperty.call(f, "Missing") ? f.Missing : null);
+    const FP_FIELDS = [
+      ["repo_root", "仓库根"], ["commit", "commit"], ["dirty", "dirty"],
+      ["bin_path", "bin_path"], ["bin_hash", "bin_hash"], ["build_time", "build_time"],
+      ["chip", "chip（Phase 7）"], ["probe_id", "probe_id（Phase 7）"],
+    ];
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[c]));
+    }
+
+    /** 指纹段 → HTML：已采集显示 commit/dirty/bin_hash + 取不到字段的原文原因；未采集显示原因。 */
+    function fingerprintHtml(fp) {
+      if (!fp) return '<span class="reason">指纹段读不到（会话头非法，见该条的问题说明）</span>';
+      const collected = fp.collected || null;
+      if (!collected) {
+        const reason = fp.not_collected || "（头里既没有指纹也没有原因——这本身是异常）";
+        return '<span class="reason">未采集（原因: ' + escapeHtml(reason) + '）</span>';
+      }
+      const commit = fpValue(collected.commit);
+      const dirty = fpValue(collected.dirty);
+      const binHash = fpValue(collected.bin_hash);
+      const parts = [
+        'commit <span class="commit">' + (commit ? escapeHtml(commit) : "取不到") + "</span>",
+        "dirty " + (dirty === null ? "取不到" : dirty),
+        "bin_hash " + (binHash ? escapeHtml(binHash) : "取不到"),
+      ];
+      // 取不到的字段一律打印**原因原文**，绝不只说“采集失败”。
+      const missing = FP_FIELDS
+        .map(([key, label]) => [label, collected[key] ? fpReason(collected[key]) : null])
+        .filter((pair) => !!pair[1])
+        .map((pair) => pair[0] + ": 取不到（原因: " + escapeHtml(pair[1]) + "）");
+      const missingHtml = missing.length
+        ? '<div class="missing">' + missing.map((m) => "<div>" + m + "</div>").join("") + "</div>"
+        : "";
+      return "<div>已采集</div>" + missingHtml + "<div>" + parts.map((p) => "<span>" + p + "</span>").join(" · ") + "</div>";
+    }
+
+    /** 打开会话之后的状态行：**未采集必须明示**，采集不到字段必须带原因。 */
+    function renderFingerprintStatus(fp, note) {
+      const collected = fp && fp.collected;
+      fpStatusEl.className = collected ? "ok" : "warn";
+      fpStatusEl.innerHTML = "<b>本会话固件指纹</b>：" + fingerprintHtml(fp)
+        + (note ? '<div class="missing">⚠ ' + escapeHtml(note) + "</div>" : "");
+      if (collected) {
+        const commit = fpValue(collected.commit);
+        if (commit) {
+          const btn = document.createElement("button");
+          btn.className = "tiny";
+          btn.textContent = "复制 commit";
+          btn.addEventListener("click", () => copyText(commit, "commit"));
+          fpStatusEl.appendChild(btn);
+        }
+      }
+    }
+
+    /** 参数区的诚实提示：没填仓库路径就说清楚「本会话日志将不包含固件指纹」。 */
+    function updateFpHint() {
+      const repo = ui.repoPath.value.trim();
+      const bin = ui.binPath.value.trim();
+      if (!repo) {
+        fpHintEl.className = "";
+        fpHintEl.innerHTML = "⚠ 未填仓库路径：<b>本会话日志将不包含固件指纹</b>"
+          + "（会话头里只会记下「未采集」的原因；之前从界面开的会话都是这样且毫无提示——本提示就是为此加的）。"
+          + "想带上指纹：填仓库路径，必要时再填 bin 文件。";
+      } else {
+        fpHintEl.className = "ok";
+        fpHintEl.innerHTML = "✓ 打开会话时将采集固件指纹：<b>" + escapeHtml(repo) + "</b>"
+          + (bin ? "（bin 文件：<b>" + escapeHtml(bin) + "</b>，用于算 bin_hash）" : "（未填 bin 文件：不会有 bin_hash，界面会列出原因）")
+          + "。采集只读，不会改变仓库状态。";
+      }
+    }
+
+    // =====================================================================
+    // 6. 会话控制 / 计数 / 发送 / 定时发送 / 日志列表
+    // =====================================================================
     function setRunning(on) {
       running = on;
-      openBtn.disabled = on;
-      closeBtn.disabled = !on;
-      sendBtn.disabled = !on;
-      timedStartBtn.disabled = !on;
-      timedStopBtn.disabled = true; // 由 stats 轮询按实际状态打开
-      for (const el of [portEl, baudEl, dataBitsEl, parityEl, stopBitsEl, flowControlEl]) {
-        el.disabled = on; // 运行中不可改参数（改参数 = 新会话）
+      ui.open.disabled = on;
+      ui.close.disabled = !on;
+      ui.send.disabled = !on;
+      ui.timedStart.disabled = !on;
+      ui.timedStop.disabled = true;
+      for (const el of [ui.port, ui.baud, ui.dataBits, ui.parity, ui.stopBits, ui.flowControl, ui.repoPath, ui.binPath]) {
+        el.disabled = on; // 运行中不可改参数（改参数 = 新会话）；指纹是打开时采集的，同理
       }
-      statusEl.textContent = on ? "已连接" : "未连接";
-      statusEl.className = on ? "on" : "";
+      ui.status.textContent = on ? "已连接" : "未连接";
+      ui.status.className = on ? "on" : "";
       if (!on) {
-        timedStatusEl.textContent = "定时发送未运行";
+        ui.timedStatus.textContent = "定时发送未运行";
         lastTimedNote = null;
       }
+      applyLayout(); // 控件禁用可能改变内容高度，重算一次轨道（区域尺寸仍由求解器决定）
     }
 
     async function refreshPorts() {
       try {
         const ports = await invoke("list_ports");
-        portEl.innerHTML = "";
+        ui.port.innerHTML = "";
         if (ports.length === 0) {
           log("未发现任何串口：请检查设备是否插好、驱动是否装好（core 枚举结果为空）", "err");
           return;
@@ -354,43 +934,46 @@
           const opt = document.createElement("option");
           opt.value = p.port_name;
           const id = (p.vid != null && p.pid != null)
-            ? ` VID:PID=${p.vid.toString(16).padStart(4, "0").toUpperCase()}:${p.pid.toString(16).padStart(4, "0").toUpperCase()}`
+            ? " VID:PID=" + p.vid.toString(16).padStart(4, "0").toUpperCase() + ":" + p.pid.toString(16).padStart(4, "0").toUpperCase()
             : "";
-          opt.textContent = `${p.port_name} [${p.port_type}]${id}${p.product ? " " + p.product : ""}`;
-          portEl.appendChild(opt);
+          opt.textContent = p.port_name + " [" + p.port_type + "]" + id + (p.product ? " " + p.product : "");
+          ui.port.appendChild(opt);
         }
-        log(`发现 ${ports.length} 个串口：${ports.map((p) => p.port_name).join(", ")}`, "ok");
+        log("发现 " + ports.length + " 个串口：" + ports.map((p) => p.port_name).join(", "), "ok");
       } catch (e) {
-        log(`枚举串口失败：${e}`, "err");
+        log("枚举串口失败：" + e, "err");
       }
     }
 
     async function openSession() {
-      const port = portEl.value;
+      const port = ui.port.value;
       if (!port) { log("请先刷新并选择一个端口", "err"); return; }
-      const baud = parseInt(baudEl.value, 10);
-      if (!Number.isFinite(baud) || baud <= 0) { log(`波特率不合法：${baudEl.value}`, "err"); return; }
-      // 一个配置对象传全部参数（后端据此构造 core 的 SerialFrame）
+      const baud = parseInt(ui.baud.value, 10);
+      if (!Number.isFinite(baud) || baud <= 0) { log("波特率不合法：" + ui.baud.value, "err"); return; }
+      // 一个配置对象传全部参数（后端据此构造 core 的 SerialFrame + 采集固件指纹）
       const config = {
-        port,
-        baud,
-        dataBits: dataBitsEl.value,
-        parity: parityEl.value,
-        stopBits: stopBitsEl.value,
-        flowControl: flowControlEl.value,
+        port: port,
+        baud: baud,
+        dataBits: ui.dataBits.value,
+        parity: ui.parity.value,
+        stopBits: ui.stopBits.value,
+        flowControl: ui.flowControl.value,
+        repoPath: ui.repoPath.value,
+        binPath: ui.binPath.value,
       };
+      if (!ui.repoPath.value.trim()) {
+        log("提示：未填仓库路径 → 本会话日志将不包含固件指纹（会话头里只会记下“未采集”的原因）。", "warn");
+      }
       try {
-        const info = await invoke("open_session", { config });
+        const info = await invoke("open_session", { config: config });
         setRunning(true);
-        log(`会话已开启：${info.port} @ ${info.baud} ${info.frame}`, "ok");
-        log(`会话 id ${info.session_id}；日志目录 ${info.session_dir}`, "dim");
-        log(
-          `时间戳基准：start_wall_ms=${info.start_wall_ms} / start_mono_micros=${info.start_mono_micros}（会话创建点，非首批到达时刻）`,
-          "dim",
-        );
+        log("会话已开启：" + info.port + " @ " + info.baud + " " + info.frame, "ok");
+        log("会话 id " + info.session_id + "；日志目录 " + info.session_dir, "dim");
+        log("时间戳基准：start_wall_ms=" + info.start_wall_ms + " / start_mono_micros=" + info.start_mono_micros + "（会话创建点，非首批到达时刻）", "dim");
+        renderFingerprintStatus(info.fingerprint, info.fingerprint_note);
       } catch (e) {
         // 失败原因原样来自后端：参数冲突（core 给的具体冲突说明）、端口不在列表、可能被占用…
-        log(`打开失败：${e}`, "err");
+        log("打开失败：" + e, "err");
         setRunning(false);
       }
     }
@@ -399,98 +982,78 @@
       try {
         const info = await invoke("close_session");
         setRunning(false);
-        log(
-          `会话已关闭：${info.port}（RX ${info.rx_bytes} / TX ${info.tx_bytes} / 显示丢弃 ${info.display_dropped_bytes} / 定时发送 ${info.timed_send_count} 帧）`,
-          "ok",
-        );
-        log(`日志已落盘：${info.session_dir}`, "dim");
+        log("会话已关闭：" + info.port + "（RX " + info.rx_bytes + " / TX " + info.tx_bytes
+          + " / 显示丢弃 " + info.display_dropped_bytes + " / 定时发送 " + info.timed_send_count + " 帧）", "ok");
+        log("日志已落盘：" + info.session_dir, "dim");
       } catch (e) {
-        log(`关闭失败：${e}`, "err");
+        log("关闭失败：" + e, "err");
       }
       refreshStats();
     }
 
-    // ---- 计数（后端权威，前端不自己算 RX/TX）----
     async function refreshStats() {
       let s;
       try {
         s = await invoke("session_stats");
       } catch (e) {
-        log(`读计数失败：${e}`, "err");
-        return;
+        return; // 不在 Tauri 里（例如纯浏览器跑布局自检）就不再刷屏
       }
-      rxBytesEl.textContent = s.rx_bytes;
-      txBytesEl.textContent = s.tx_bytes;
-      dropBytesEl.textContent = s.display_dropped_bytes;
-      extraEl.textContent = s.running
-        ? `${s.port} @ ${s.baud} ${s.frame} / 已落盘 ${s.logged_bytes} 字节 / TX 次数 ${s.tx_writes} / 发送失败 ${s.tx_errors}`
-        : (s.port ? `上一次会话 ${s.port} @ ${s.baud} ${s.frame}（已停止，计数为最终值）` : "");
+      ui.rxBytes.textContent = s.rx_bytes;
+      ui.txBytes.textContent = s.tx_bytes;
+      ui.dropBytes.textContent = s.display_dropped_bytes;
+      ui.extra.textContent = s.running
+        ? s.port + " @ " + s.baud + " " + s.frame + " / 已落盘 " + s.logged_bytes + " 字节 / TX 次数 " + s.tx_writes + " / 发送失败 " + s.tx_errors
+        : (s.port ? "上一次会话 " + s.port + " @ " + s.baud + " " + s.frame + "（已停止，计数为最终值）" : "");
+      ui.extra.className = s.display_dropped_bytes > 0 ? "warn" : "dim";
 
       if (s.running !== running) setRunning(s.running);
 
-      // 定时发送：按钮可用性与状态说明都随真实状态变化
-      timedStartBtn.disabled = !s.running;
-      timedStopBtn.disabled = !s.timed_send_running;
+      ui.timedStart.disabled = !s.running;
+      ui.timedStop.disabled = !s.timed_send_running;
       if (s.timed_send_running) {
-        timedStatusEl.textContent = `定时发送中：每 ${s.timed_send_interval_ms} ms 一帧，已发 ${s.timed_send_count} 帧`;
+        ui.timedStatus.textContent = "定时发送中：每 " + s.timed_send_interval_ms + " ms 一帧，已发 " + s.timed_send_count + " 帧";
       } else if (s.timed_send_count > 0) {
-        timedStatusEl.textContent = `定时发送已停止（共 ${s.timed_send_count} 帧）`;
+        ui.timedStatus.textContent = "定时发送已停止（共 " + s.timed_send_count + " 帧）";
       } else {
-        timedStatusEl.textContent = "定时发送未运行";
+        ui.timedStatus.textContent = "定时发送未运行";
       }
       if (s.timed_send_note && s.timed_send_note !== lastTimedNote) {
         lastTimedNote = s.timed_send_note;
-        log(`定时发送：${s.timed_send_note}`, "warn");
+        log("定时发送：" + s.timed_send_note, "warn");
       }
-
       if (s.fatal_error && s.fatal_error !== lastFatal) {
         lastFatal = s.fatal_error;
-        log(`采集已停止（致命错误）：${s.fatal_error}`, "err");
+        log("采集已停止（致命错误）：" + s.fatal_error, "err");
       }
       if (s.tx_errors > 0 && s.last_error && s.last_error !== lastTxError) {
         lastTxError = s.last_error;
-        log(`发送失败：${s.last_error}`, "err");
-      }
-      if (s.display_dropped_bytes > 0) {
-        extraEl.className = "warn";
-        extraEl.textContent += `　⚠ 显示已丢弃 ${s.display_dropped_bytes} 字节（${s.display_dropped_batches} 批）；落盘不受影响`;
-      } else {
-        extraEl.className = "dim";
+        log("发送失败：" + s.last_error, "err");
       }
     }
 
-    // ---- 发送 ----
     async function send() {
       try {
-        const r = await invoke("send_data", {
-          data: txInput.value,
-          mode: txMode.value,
-          append: txAppend.value,
-        });
-        log(`已发送 ${r.bytes} 字节（HEX ${r.hex}）；累计 TX ${r.total_tx_bytes} 字节`, "ok");
-        txInput.value = "";
+        const r = await invoke("send_data", { data: ui.txInput.value, mode: ui.txMode.value, append: ui.txAppend.value });
+        log("已发送 " + r.bytes + " 字节（HEX " + r.hex + "）；累计 TX " + r.total_tx_bytes + " 字节", "ok");
+        ui.txInput.value = "";
       } catch (e) {
-        log(`发送失败：${e}`, "err");
+        log("发送失败：" + e, "err");
       }
     }
 
-    // ---- 定时发送 ----
     async function startTimedSend() {
-      const interval = Number(timedIntervalEl.value.trim());
+      const interval = Number(ui.timedInterval.value.trim());
       if (!Number.isInteger(interval) || interval <= 0) {
-        log(`定时发送间隔非法：${timedIntervalEl.value}（必须是 ≥ 1 的整数毫秒）`, "err");
+        log("定时发送间隔非法：" + ui.timedInterval.value + "（必须是 ≥ 1 的整数毫秒）", "err");
         return;
       }
       try {
         const r = await invoke("start_timed_send", {
-          intervalMs: interval,
-          data: txInput.value,
-          mode: txMode.value,
-          append: txAppend.value,
+          intervalMs: interval, data: ui.txInput.value, mode: ui.txMode.value, append: ui.txAppend.value,
         });
-        log(`定时发送已启动：每 ${r.interval_ms} ms 发一帧 ${r.frame_bytes} 字节（HEX ${r.frame_hex}）`, "ok");
+        log("定时发送已启动：每 " + r.interval_ms + " ms 发一帧 " + r.frame_bytes + " 字节（HEX " + r.frame_hex + "）", "ok");
       } catch (e) {
-        log(`定时发送启动失败：${e}`, "err");
+        log("定时发送启动失败：" + e, "err");
       }
       refreshStats();
     }
@@ -498,21 +1061,682 @@
     async function stopTimedSend() {
       try {
         const r = await invoke("stop_timed_send");
-        log(`定时发送已停止：共发出 ${r.count} 帧（间隔 ${r.interval_ms} ms）`, "ok");
+        log("定时发送已停止：共发出 " + r.count + " 帧（间隔 " + r.interval_ms + " ms）", "ok");
       } catch (e) {
-        log(`停止定时发送失败：${e}`, "err");
+        log("停止定时发送失败：" + e, "err");
       }
       refreshStats();
     }
 
-    // ---- 绑定 ----
-    document.getElementById("refresh").addEventListener("click", refreshPorts);
-    openBtn.addEventListener("click", openSession);
-    closeBtn.addEventListener("click", closeSession);
-    sendBtn.addEventListener("click", send);
-    timedStartBtn.addEventListener("click", startTimedSend);
-    timedStopBtn.addEventListener("click", stopTimedSend);
-    document.getElementById("clear").addEventListener("click", () => {
+    function showOverlay(show) {
+      ui.sessionsOverlay.classList.toggle("open", !!show);
+      if (show) {
+        ui.sessionsRoot.focus();
+        loadSessions();
+      }
+    }
+
+    async function loadSessions() {
+      ui.listStatus.textContent = "加载中…";
+      try {
+        const dto = await invoke("list_sessions", { root: ui.sessionsRoot.value });
+        renderSessionList(dto);
+      } catch (e) {
+        ui.listStatus.textContent = "加载失败：" + e;
+        log("读取日志列表失败：" + e, "err");
+      }
+    }
+
+    function renderSessionList(dto) {
+      const rows = dto.sessions || [];
+      ui.listStatus.textContent = "根目录 " + dto.root + "｜会话 " + rows.length
+        + "（可读 " + dto.ok_count + " / 有问题 " + dto.broken_count + "）"
+        + (dto.root_problem ? "｜⚠ " + dto.root_problem : "");
+      sessionListEl.textContent = "";
+      if (dto.root_problem) {
+        const d = document.createElement("div");
+        d.className = "empty";
+        d.textContent = "根目录问题：" + dto.root_problem;
+        sessionListEl.appendChild(d);
+      }
+      if (dto.is_empty || rows.length === 0) {
+        const d = document.createElement("div");
+        d.className = "empty";
+        d.textContent = "没有会话（该目录下没有任何会话子目录）";
+        sessionListEl.appendChild(d);
+        return;
+      }
+      for (const row of rows) {
+        const item = document.createElement("div");
+        item.className = "session-item" + (row.problem ? " broken" : "");
+        const when = row.start_wall_ms == null ? "起始时间未知（会话头不可读）" : fmtWall(row.start_wall_ms);
+        const head = document.createElement("div");
+        head.className = "head";
+        head.innerHTML = '<span class="commit">' + escapeHtml(row.id) + "</span>"
+          + "<span>" + escapeHtml(when) + "</span>"
+          + "<span>" + escapeHtml(row.source_config || "来源未知（会话头不可读）") + "</span>"
+          + "<span>" + row.payload_bytes + " 字节 / " + row.records + " 条 / " + row.segments + " 个分片</span>";
+        item.appendChild(head);
+        const fp = document.createElement("div");
+        fp.className = "fp";
+        fp.innerHTML = "<b>指纹</b>：" + fingerprintHtml(row.fingerprint);
+        item.appendChild(fp);
+        const commit = row.fingerprint && row.fingerprint.collected
+          ? fpValue(row.fingerprint.collected.commit) : null;
+        const actions = document.createElement("div");
+        actions.className = "head";
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "tiny";
+        copyBtn.textContent = "复制 commit";
+        copyBtn.disabled = !commit;
+        copyBtn.title = commit ? commit : "这条日志没有采集到 commit（原因见上）";
+        copyBtn.addEventListener("click", () => copyText(commit, "commit"));
+        actions.appendChild(copyBtn);
+        const logBtn = document.createElement("button");
+        logBtn.className = "tiny";
+        logBtn.textContent = "复制这条日志的路径";
+        logBtn.addEventListener("click", () => copyText(row.dir, "日志目录"));
+        actions.appendChild(logBtn);
+        if (row.problem) {
+          const warn = document.createElement("span");
+          warn.className = "reason";
+          warn.textContent = "⚠ " + row.problem;
+          actions.appendChild(warn);
+        }
+        item.appendChild(actions);
+        sessionListEl.appendChild(item);
+      }
+      // 跳过条目（不是目录）也要看得见 —— 只报计数等于把信息藏起来。
+      if (dto.skipped && dto.skipped.length) {
+        const box = document.createElement("div");
+        box.className = "empty";
+        box.innerHTML = "<b>跳过条目（不是目录，不计入会话）</b>"
+          + dto.skipped.map((s) => "<div>" + escapeHtml(s.name) + "：" + escapeHtml(s.reason) + "</div>").join("");
+        sessionListEl.appendChild(box);
+      }
+    }
+
+    /** 复制到剪贴板：优先 Clipboard API，失败退回临时 textarea（老 WebView 也能用）。 */
+    async function copyText(text, label) {
+      if (!text) { log("没有可复制的" + label, "warn"); return false; }
+      try {
+        await navigator.clipboard.writeText(text);
+        log("已复制" + label + "：" + text, "ok");
+        return true;
+      } catch (e) {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          document.body.removeChild(ta);
+          if (ok) { log("已复制" + label + "：" + text, "ok"); return true; }
+        } catch (e2) { /* 继续往下报错 */ }
+        log("复制" + label + "失败：" + e + "（内容已显示在界面上，可手动选中复制）", "err");
+        return false;
+      }
+    }
+
+    // =====================================================================
+    // 7. 布局不变量 harness：?selftest=1（或点「跑布局自检」）
+    //
+    //    **只测量，不改正常布局**：先把尺寸与可见性存起来，跑完原样还原。
+    //    断言：① 任意两个可见区域不相交 ② 区域盒子不被内容撑大、内容必须被裁剪
+    //         ③ 关键控件 elementFromPoint 命中自己 ④ 每区 ≥ 最小值 ⑤ 无非预期横向滚动
+    //    交互路径（t24）：拖到两个方向极限、逐区关闭再重开、尝试关常驻区域，
+    //    全部通过**真实事件处理函数**驱动，并对每个交互后的状态复用上面同一套断言。
+    // =====================================================================
+    const SELFTEST_SIZES = [
+      { w: 1600, h: 1000 }, { w: 1280, h: 800 }, { w: 1024, h: 720 },
+      { w: 800, h: 600 }, { w: 640, h: 480 }, { w: 480, h: 360 },
+      { w: 1600, h: 320 }, { w: 360, h: 1200 }, { w: 300, h: 240 },
+    ];
+    const SELFTEST_CONTROLS = ["refresh", "port", "open", "close", "send", "clear", "showTs", "repoPath", "txInput"];
+
+    // ---- 交互驱动：全部走真实事件处理函数（不是直接改状态）----
+    function fire(el, type, props) {
+      const extra = Object.assign({ bubbles: true, cancelable: true }, props || {});
+      const ev = DRAG.isPointer
+        ? new PointerEvent(type, Object.assign({ pointerId: 1, pointerType: "mouse", buttons: 1 }, extra))
+        : new MouseEvent(type, Object.assign({ buttons: 1 }, extra));
+      el.dispatchEvent(ev);
+    }
+
+    function splitterAt(nodeId, index) {
+      return (splitterEls.get(nodeId) || [])[index] || null;
+    }
+
+    /** 真事件拖拽：在分隔条上 pointerdown → window 上 pointermove/pointerup。 */
+    function dragSplitter(nodeId, index, delta) {
+      const sp = splitterAt(nodeId, index);
+      if (!sp) return { ok: false, reason: "没有 " + nodeId + " 的第 " + index + " 条分隔条" };
+      const r = sp.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      fire(sp, DRAG.down, { clientX: x, clientY: y });
+      fire(window, DRAG.move, { clientX: x + delta, clientY: y + delta });
+      fire(window, DRAG.up, { clientX: x + delta, clientY: y + delta });
+      return { ok: true, delta: delta };
+    }
+
+    function dblclickSplitter(nodeId, index) {
+      const sp = splitterAt(nodeId, index);
+      if (!sp) return { ok: false, reason: "没有 " + nodeId + " 的第 " + index + " 条分隔条" };
+      fire(sp, "dblclick", {});
+      return { ok: true };
+    }
+
+    /** 真事件关闭：点该区域标题栏的关闭按钮。 */
+    function clickCloseButton(id) {
+      const region = regions.get(id);
+      const btn = region && region.head.querySelector("button");
+      if (!btn) return { ok: false, reason: id + " 没有关闭按钮（常驻区域）" };
+      fire(btn, "click", {});
+      return { ok: true };
+    }
+
+    /** 真事件重开：勾上参数区「区域」块里对应的复选框。 */
+    function toggleRegionFromGlobalEntry(id, on) {
+      const box = ui.regionToggles.querySelector('input[data-region-toggle="' + id + '"]');
+      if (!box) return { ok: false, reason: "区域入口里没有 " + id };
+      box.checked = !!on;
+      fire(box, "change", {});
+      return { ok: true };
+    }
+
+    /** 记录所有容器的轨道尺寸（拖拽的「只影响相邻两个」就靠它精确核对）。 */
+    function snapshotTracks() {
+      const res = solveNow();
+      const out = {};
+      for (const nodeId of Object.keys(res.tracks)) out[nodeId] = res.tracks[nodeId].sizes.slice();
+      return out;
+    }
+
+    /** 每个区域的开关/重开/常驻拒绝 + 每条分隔条的极限拖拽 + 双击复位。 */
+    function interactionPlan() {
+      const plan = [];
+      const containers = ["root", "right"];
+      for (const nodeId of containers) {
+        const count = (splitterEls.get(nodeId) || []).length;
+        for (let i = 0; i < count; i += 1) {
+          for (const delta of [99999, -99999]) {
+            plan.push({
+              name: "拖 " + nodeId + "#" + i + " 到 " + (delta > 0 ? "正向" : "负向") + "极限",
+              drag: { containerId: nodeId, index: i },
+              run: () => dragSplitter(nodeId, i, delta),
+            });
+          }
+          plan.push({ name: "双击 " + nodeId + "#" + i + " 恢复默认比例", run: () => dblclickSplitter(nodeId, i) });
+        }
+      }
+      for (const id of REGION_ORDER) {
+        plan.push({
+          name: "关闭再重开 " + id,
+          run: () => {
+            const closed = clickCloseButton(id);
+            const reopened = toggleRegionFromGlobalEntry(id, true);
+            return { closed: closed, reopened: reopened };
+          },
+        });
+      }
+      plan.push({
+        name: "尝试关闭常驻区域（必须被拒绝且界面不变）",
+        run: () => {
+          const a = setVisible("params", false);
+          const b = setVisible("rx", false);
+          return { params: a, rx: b, stillVisible: !!(state.visible.params && state.visible.rx) };
+        },
+      });
+      return plan;
+    }
+
+    function visibilityCombos() {
+      const closable = REGION_ORDER.filter((id) => REGIONS[id].closable);
+      const combos = [];
+      for (let mask = 0; mask < (1 << closable.length); mask += 1) {
+        const v = {};
+        closable.forEach((id, i) => { v[id] = (mask & (1 << i)) === 0; });
+        combos.push(v);
+      }
+      return combos;
+    }
+
+    function round2(n) { return Math.round(n * 100) / 100; }
+
+    /** 把 elementFromPoint 的命中元素描述清楚（用于报错里点名「被谁挡住/裁掉」）。 */
+    function describeHit(hit) {
+      if (!hit) return "null（该点没有任何元素 —— 多半被祖先裁剪或不在视口内）";
+      const id = hit.id ? "#" + hit.id : "";
+      const cls = hit.className ? "." + String(hit.className).split(/\s+/).filter(Boolean).join(".") : "";
+      return hit.tagName.toLowerCase() + id + cls + (hit.dataset && hit.dataset.regionId ? "（区域 " + hit.dataset.regionId + "）" : "");
+    }
+
+    /**
+     * 度量当前布局。返回 `{ok, rects, visible, problems, skipped}`。
+     *
+     * **对视口鲁棒（F2 修复）**：模拟尺寸可以比真实窗口大得多，这时
+     * `document.elementFromPoint` 对落在窗口外的点返回 null、整页也必然出现滚动条，
+     * 拿它们判失败就是**假失败**（真实窗口约 1025 宽时，≥1024 的用例会整片误报）。
+     * 所以：能在**被测布局自己**身上量的（#app 自己的溢出、区域盒子、轨道/孩子数）
+     * 一律量在自己身上；只有那些**在当前真实视口下无法成立**的检查才标成「跳过 + 原因」，
+     * 既不计入失败，也不静默略过。
+     */
+    function measureState() {
+      const problems = [];
+      const skipped = [];
+      const rects = {};
+      const viewport = { w: window.innerWidth, h: window.innerHeight };
+      const visibleIds = REGION_ORDER.filter((id) => regions.has(id) && !regions.get(id).el.hidden);
+      for (const id of visibleIds) {
+        const r = regions.get(id).el.getBoundingClientRect();
+        rects[id] = { x: round2(r.x), y: round2(r.y), w: round2(r.width), h: round2(r.height) };
+      }
+
+      // ① 两两不相交
+      for (let i = 0; i < visibleIds.length; i += 1) {
+        for (let j = i + 1; j < visibleIds.length; j += 1) {
+          const a = rects[visibleIds[i]];
+          const b = rects[visibleIds[j]];
+          const overlapX = Math.min(a.x + a.w, b.x + b.w) > Math.max(a.x, b.x) + 0.5;
+          const overlapY = Math.min(a.y + a.h, b.y + b.h) > Math.max(a.y, b.y) + 0.5;
+          if (overlapX && overlapY) {
+            problems.push({ rule: "overlap", detail: visibleIds[i] + " 与 " + visibleIds[j] + " 相交" });
+          }
+        }
+      }
+
+      // ①.5 **轨道数必须等于可见 grid item 数**（F1 错位缺陷的机器判据）
+      //     被隐藏的区域若仍是 grid item（`.region{display:flex}` 盖住 UA 的 `[hidden]`），
+      //     求解器已删轨道、DOM 却仍占位 ⇒ 这里立刻不等。
+      for (const nodeId of Object.keys(lastSolve ? lastSolve.tracks : {})) {
+        const el = nodes.get(nodeId);
+        if (!el) continue;
+        const track = lastSolve.tracks[nodeId];
+        const tpl = (track.kind === "cols" ? el.style.gridTemplateColumns : el.style.gridTemplateRows) || "";
+        const totalTracks = tpl.trim() ? tpl.trim().split(/\s+/).length : 0;
+        const items = Array.from(el.children).filter((c) => getComputedStyle(c).display !== "none").length;
+        const expected = track.sizes.length > 0 ? track.sizes.length * 2 - 1 : 0;
+        if (totalTracks !== items || totalTracks !== expected) {
+          problems.push({
+            rule: "track-item-mismatch",
+            detail: "容器 " + nodeId + " 的轨道数 " + totalTracks + " ≠ 可见 grid item 数 " + items
+              + "（应有 " + expected + " 条轨道 / 项）——隐藏项没被真正移出布局，轨道与孩子错位",
+          });
+        }
+      }
+
+      // ② 区域盒子不被内容撑大；内容溢出必须被裁剪/滚动（不允许画到盒子外）
+      for (const id of visibleIds) {
+        const region = regions.get(id);
+        const el = region.el;
+        const box = el.getBoundingClientRect();
+        if (el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1) {
+          problems.push({
+            rule: "box-grown",
+            detail: id + " 的盒子被内容撑大（scroll " + el.scrollWidth + "x" + el.scrollHeight
+              + " > client " + el.clientWidth + "x" + el.clientHeight + "）",
+          });
+        }
+        const cs = getComputedStyle(region.body);
+        if (cs.overflowX === "visible" || cs.overflowY === "visible") {
+          problems.push({ rule: "not-clipped", detail: id + " 的内容容器没有裁剪（overflow=" + cs.overflow + "）" });
+        }
+        for (const child of el.children) {
+          const cr = child.getBoundingClientRect();
+          if (cr.bottom > box.bottom + 0.5 || cr.right > box.right + 0.5
+            || cr.top < box.top - 0.5 || cr.left < box.left - 0.5) {
+            problems.push({ rule: "paint-out", detail: id + " 的子元素画到了区域盒子之外" });
+            break;
+          }
+        }
+      }
+
+      // ③ 关键控件命中自己（无遮挡）。控件若在**真实视口之外**（模拟尺寸比窗口大），
+      //    `elementFromPoint` 拿不到它 —— 这属于「本视口下无法成立」，标跳过并写原因。
+      //    **命中判定只接受「控件本身或其子孙」**：以前还接受 `hit.contains(el)`（命中的是控件祖先），
+      //    于是「控件被某个祖先整块裁掉」会被读成通过 —— RC1 那个 bug 正是这样逃过 44 个状态的。
+      for (const id of SELFTEST_CONTROLS) {
+        const el = document.getElementById(id);
+        if (!el || el.offsetParent === null) continue; // 不可见的不参与
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const outside = r.top < 0 || r.left < 0 || r.bottom > viewport.h + 0.5 || r.right > viewport.w + 0.5;
+        if (outside) {
+          skipped.push({
+            rule: "control-covered",
+            target: id,
+            reason: "控件不在真实视口内（渲染尺寸 " + viewport.w + "x" + viewport.h + "，控件 rect "
+              + round2(r.left) + "," + round2(r.top) + " " + round2(r.width) + "x" + round2(r.height)
+              + "）——elementFromPoint 在本视口下无法判定，标为跳过",
+          });
+          continue;
+        }
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        if (!hit || !(hit === el || el.contains(hit))) {
+          problems.push({
+            rule: "control-covered",
+            detail: "控件 " + id + " 没有真正画出来：命中 " + describeHit(hit)
+              + (hit && hit.contains && hit.contains(el)
+                ? "（命中的是它的**祖先** ⇒ 被祖先裁剪/遮挡）" : ""),
+          });
+        }
+      }
+
+      // ③.5 `region-clipped`（**硬规则**，与真实视口无关 → 永远可判定、永不跳过）：
+      //      每个可见区域必须完整落在**每个祖先容器**的矩形内。祖先都是 `overflow: hidden`，
+      //      超出部分就是被裁掉的部分 —— RC1 正是这样把右侧整块裁掉的（根分割只有 300px 宽，
+      //      它的孩子却有上千像素宽，于是「区域自身 rect 正常、但整块被祖先裁掉」）。
+      for (const id of visibleIds) {
+        const el = regions.get(id).el;
+        const r = el.getBoundingClientRect();
+        let p = el.parentElement;
+        while (p && p !== document.body) {
+          const pr = p.getBoundingClientRect();
+          if (r.left < pr.left - 0.5 || r.top < pr.top - 0.5
+            || r.right > pr.right + 0.5 || r.bottom > pr.bottom + 0.5) {
+            problems.push({
+              rule: "region-clipped",
+              detail: "区域 " + id + " 超出祖先容器 " + describeHit(p)
+                + " 的矩形（祖先 overflow:hidden ⇒ 超出部分被裁掉）",
+            });
+            break;
+          }
+          p = p.parentElement;
+        }
+      }
+
+      // ③.6 `region-covered`（视口相关，允许跳过）：在**区域矩形 ∩ 真实视口**的中心取命中，
+      //      命中必须是该区域或其子孙，**命中祖先即报错**（祖先命中 = 被祖先裁剪/遮挡 ⇒
+      //      正是本次 RC1 逃过 44 个状态的那条漏洞）。取交集中心是为了让这条检查在
+      //      绝大多数模拟尺寸下都能判定；只有「整个区域都在真实视口外」时交集为空、无法取样，
+      //      这时跳过并写明原因（不静默略过）。
+      for (const id of visibleIds) {
+        const el = regions.get(id).el;
+        const r = el.getBoundingClientRect();
+        const left = Math.max(r.left, 0);
+        const top = Math.max(r.top, 0);
+        const right = Math.min(r.right, viewport.w);
+        const bottom = Math.min(r.bottom, viewport.h);
+        if (right - left < 1 || bottom - top < 1) {
+          skipped.push({
+            rule: "region-covered",
+            target: id,
+            reason: "区域 " + id + " 与真实视口 " + viewport.w + "x" + viewport.h
+              + " 的交集为空（rect " + round2(r.left) + "," + round2(r.top) + " "
+              + round2(r.width) + "x" + round2(r.height) + "），无可取样点 → 跳过命中检查"
+              + "（几何裁剪检查 region-clipped 仍然执行过）",
+          });
+          continue;
+        }
+        const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+        if (!hit || !(hit === el || el.contains(hit))) {
+          problems.push({
+            rule: "region-covered",
+            detail: "区域 " + id + " 没真正画出来：在它可见部分的中心命中 " + describeHit(hit)
+              + (hit && hit.contains && hit.contains(el)
+                ? "（命中的是它的**祖先** ⇒ 区域被祖先裁剪/遮挡）" : ""),
+          });
+        }
+      }
+
+      // ④ 每区 ≥ 其最小值
+      for (const id of visibleIds) {
+        const def = REGIONS[id];
+        if (rects[id].w < def.minW - 0.5 || rects[id].h < def.minH - 0.5) {
+          problems.push({
+            rule: "below-min",
+            detail: id + " 低于最小值：" + rects[id].w + "x" + rects[id].h + " < " + def.minW + "x" + def.minH,
+          });
+        }
+      }
+
+      // ⑤ 横向滚动，分两条量：
+      //   ⑤a **#app 自己的**横向溢出 —— 只与布局有关，跟真实窗口多大无关，永远检查；
+      if (appEl.scrollWidth > appEl.clientWidth + 1) {
+        problems.push({
+          rule: "h-scroll",
+          detail: "#app 自身出现横向溢出（scrollWidth " + appEl.scrollWidth + " > clientWidth " + appEl.clientWidth + "）",
+        });
+      }
+      //   ⑤b **整页**横向滚动 —— 只有当模拟尺寸**放得进真实视口**时才有意义；
+      //      模拟尺寸比窗口大时，整页必然滚动（这正是小窗口兜底的设计），拿它判失败就是假失败。
+      const simW = Math.round(appEl.getBoundingClientRect().width);
+      if (simW + 20 > viewport.w) {
+        skipped.push({
+          rule: "page-h-scroll",
+          reason: "模拟宽度 " + simW + "px（+ 左右各 10px 内边距）已超过真实视口宽 " + viewport.w
+            + "px，整页必然出现滚动条（这正是小窗口兜底行为），本视口下无法判定 → 跳过",
+        });
+      } else {
+        const doc = document.documentElement;
+        if (doc.scrollWidth > doc.clientWidth + 1) {
+          problems.push({
+            rule: "page-h-scroll",
+            detail: "整页出现横向滚动（scrollWidth " + doc.scrollWidth + " > clientWidth " + doc.clientWidth + "）"
+              + "，而此时模拟尺寸 " + simW + "px 是放得进真实视口 " + viewport.w + "px 的",
+          });
+        }
+      }
+
+      return {
+        ok: problems.length === 0,
+        rects: rects,
+        visible: visibleIds,
+        problems: problems,
+        skipped: skipped,
+        viewport: viewport,
+      };
+    }
+
+    async function runSelftest() {
+      const saved = {
+        width: appEl.style.width,
+        height: appEl.style.height,
+        state: L.normalizeState({ visible: state.visible, ratios: state.ratios, sizes: state.sizes }),
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+      };
+      const states = [];
+      const failed = [];
+      let minSize = { width: 0, height: 0 };
+
+      // ---- 状态 0：**真实布局**（不覆写 #app 的宽高）----
+      // 这是本次 RC1 漏检的根因之一：以前每个状态都先设一遍尺寸，**从来没测过真实布局**，
+      // 于是「静态 CSS 与 DOM 结构不符导致右侧整块被裁」这种只在真实渲染下暴露的问题逃掉了。
+      state = L.normalizeState({ visible: saved.state.visible, ratios: saved.state.ratios, sizes: saved.state.sizes });
+      appEl.style.width = saved.width;
+      appEl.style.height = saved.height;
+      const realRes = applyLayout();
+      minSize = realRes.minSize;
+      {
+        const verdict = measureState();
+        const record = {
+          size: { w: Math.round(appEl.getBoundingClientRect().width), h: Math.round(appEl.getBoundingClientRect().height) },
+          real: true,
+          visible: Object.assign({}, state.visible),
+          minSize: realRes.minSize,
+          ok: verdict.ok,
+          rects: verdict.rects,
+          problems: verdict.problems,
+          skipped: verdict.skipped,
+        };
+        states.push(record);
+        if (!verdict.ok) failed.push(record);
+      }
+
+      for (const size of SELFTEST_SIZES) {
+        for (const combo of visibilityCombos()) {
+          state = L.normalizeState({
+            visible: Object.assign({}, state.visible, combo),
+            ratios: saved.state.ratios,
+            sizes: {},
+          });
+          appEl.style.width = size.w + "px";
+          appEl.style.height = size.h + "px";
+          const res = applyLayout();
+          minSize = res.minSize;
+          const verdict = measureState();
+          const record = {
+            size: size, visible: combo, minSize: res.minSize, ok: verdict.ok,
+            rects: verdict.rects, problems: verdict.problems, skipped: verdict.skipped,
+          };
+          states.push(record);
+          if (!verdict.ok) failed.push(record);
+        }
+      }
+
+      // ---- 交互路径（t24）：真实事件驱动，每个状态复用上面同一套不变量断言 ----
+      let interactions = 0;
+      for (const action of interactionPlan()) {
+        state = L.normalizeState({
+          visible: saved.state.visible,
+          ratios: saved.state.ratios,
+          sizes: saved.state.sizes,
+        });
+        appEl.style.width = "1024px";
+        appEl.style.height = "720px";
+        applyLayout();
+        // 拖拽要顺带证明「只影响直接相邻的两个区域」：交互前后各记一次轨道快照
+        const beforeTracks = snapshotTracks();
+        const result = action.run();
+        const verdict = measureState();
+        const extra = [];
+        interactions += 1;
+        if (action.drag) {
+          // **只影响直接相邻的两个**（精确核对）：
+          //  · 同一个容器里不相邻的孩子，轨道尺寸必须一字不变；
+          //  · 相邻两个的尺寸之和必须守恒（等量反向）；
+          //  · 其它容器的轨道必须一字不变（垂直于切分轴的那一维也不许动）。
+          const afterTracks = snapshotTracks();
+          const id = action.drag.containerId;
+          const i = action.drag.index;
+          const b = beforeTracks[id] || [];
+          const a = afterTracks[id] || [];
+          if (a.length !== b.length) {
+            extra.push({ rule: "pair-isolation", detail: "拖 " + action.name + " 后容器 " + id + " 的孩子数变了" });
+          } else {
+            for (let k = 0; k < b.length; k += 1) {
+              if (k === i || k === i + 1) continue;
+              if (Math.abs(a[k] - b[k]) > 0.5) {
+                extra.push({
+                  rule: "pair-isolation",
+                  detail: "拖 " + action.name + " 时不相邻的第 " + k + " 个孩子也变了（" + b[k] + " -> " + a[k] + "）",
+                });
+              }
+            }
+            const sumBefore = b[i] + b[i + 1];
+            const sumAfter = a[i] + a[i + 1];
+            if (Math.abs(sumBefore - sumAfter) > 0.5) {
+              extra.push({
+                rule: "pair-isolation",
+                detail: "拖 " + action.name + " 时相邻一对的和不守恒（" + sumBefore + " -> " + sumAfter + "）",
+              });
+            }
+          }
+          for (const otherId of Object.keys(beforeTracks)) {
+            if (otherId === id) continue;
+            const bb = beforeTracks[otherId];
+            const aa = afterTracks[otherId] || [];
+            if (bb.length !== aa.length) {
+              extra.push({ rule: "pair-isolation", detail: "拖 " + action.name + " 把容器 " + otherId + " 的结构改了" });
+              continue;
+            }
+            for (let k = 0; k < bb.length; k += 1) {
+              if (Math.abs(aa[k] - bb[k]) > 0.5) {
+                extra.push({
+                  rule: "pair-isolation",
+                  detail: "拖 " + action.name + " 影响了不相干容器 " + otherId + " 的轨道（" + bb[k] + " -> " + aa[k] + "）",
+                });
+              }
+            }
+          }
+        }
+        if (action.name.indexOf("常驻") >= 0) {
+          const ok = !!(state.visible.params && state.visible.rx);
+          if (!ok) extra.push({ rule: "guard-failed", detail: "常驻区域被关掉了" });
+        }
+        if (action.name.indexOf("关闭再重开") >= 0) {
+          const id = action.name.replace("关闭再重开 ", "");
+          if (!state.visible[id]) extra.push({ rule: "reopen-failed", detail: id + " 关掉后没能从「区域」入口重新打开" });
+        }
+        const problems = verdict.problems.concat(extra);
+        const record = {
+          interaction: action.name, action: result, ok: problems.length === 0,
+          rects: verdict.rects, problems: problems, skipped: verdict.skipped,
+        };
+        states.push(record);
+        if (!record.ok) failed.push(record);
+      }
+
+      // 还原（自检不得改变正常布局）
+      state = saved.state;
+      appEl.style.width = saved.width;
+      appEl.style.height = saved.height;
+      applyLayout();
+      window.scrollTo(saved.scrollX, saved.scrollY);
+
+      // 跳过项按规则聚合（每个状态都可能跳同一条，报告里只列一次 + 出现次数 + 样例原因）
+      const skippedAgg = [];
+      for (const st of states) {
+        for (const sk of st.skipped || []) {
+          let hit = skippedAgg.find((x) => x.rule === sk.rule);
+          if (!hit) {
+            hit = { rule: sk.rule, count: 0, sampleReason: sk.reason };
+            skippedAgg.push(hit);
+          }
+          hit.count += 1;
+        }
+      }
+
+      const report = {
+        verdict: failed.length ? "FAIL" : "PASS",
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        checkedStates: states.length,
+        failedStates: failed.length,
+        layoutStates: states.length - interactions,
+        interactions: interactions,
+        skippedChecks: skippedAgg,
+        sizes: SELFTEST_SIZES,
+        minSize: minSize,
+        failures: failed.map((p) => ({
+          size: p.size || null,
+          realLayout: !!p.real,
+          visible: p.visible || null,
+          interaction: p.interaction || null,
+          action: p.action || null,
+          minSize: p.minSize || null,
+          problems: p.problems,
+        })),
+      };
+      ui.selftestVerdict.textContent = report.verdict;
+      ui.selftestVerdict.className = report.verdict === "PASS" ? "pass" : "fail";
+      ui.selftestSummary.textContent = "检查了 1 个真实布局状态 + " + (report.layoutStates - 1) + " 个尺寸×可见性状态 + "
+        + report.interactions + " 个交互动作（拖到两个方向极限、逐区关闭再重开、常驻区域拒绝、双击复位），失败 "
+        + report.failedStates + " 个；真实视口 " + report.viewport.width + "×" + report.viewport.height
+        + "px；区域最小值之和 " + report.minSize.width + "×" + report.minSize.height + "px。"
+        + (skippedAgg.length
+          ? "【跳过 " + skippedAgg.reduce((n, x) => n + x.count, 0) + " 条检查】"
+            + skippedAgg.map((x) => " " + x.rule + "×" + x.count + "（" + x.sampleReason + "）").join("；")
+          : "")
+        + (report.failedStates ? "失败状态的最小复现见下方 JSON。" : "全部可判定的不变量成立。");
+      ui.selftestJson.textContent = JSON.stringify(report, null, 2);
+      ui.selftestReport.classList.add("open");
+      return report;
+    }
+
+    // =====================================================================
+    // 8. 事件绑定 + 启动
+    // =====================================================================
+    ui.refresh.addEventListener("click", refreshPorts);
+    ui.open.addEventListener("click", openSession);
+    ui.close.addEventListener("click", closeSession);
+    ui.send.addEventListener("click", send);
+    ui.timedStart.addEventListener("click", startTimedSend);
+    ui.timedStop.addEventListener("click", stopTimedSend);
+    ui.clear.addEventListener("click", () => {
       chunks = [];
       retained = 0;
       rerender();
@@ -521,21 +1745,57 @@
     for (const radio of document.querySelectorAll('input[name="view"]')) {
       radio.addEventListener("change", rerender);
     }
-    showTsEl.addEventListener("change", rerender);
-    txInput.addEventListener("keydown", (e) => {
+    ui.showTs.addEventListener("change", rerender);
+    ui.txInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); send(); }
     });
+    // 指纹：输入变化即时更新「参数区提示」（打开之前就必须说清楚有没有指纹）
+    ui.repoPath.addEventListener("input", updateFpHint);
+    ui.binPath.addEventListener("input", updateFpHint);
+    // 日志列表浮层
+    ui.listSessions.addEventListener("click", () => showOverlay(true));
+    ui.sessionsClose.addEventListener("click", () => showOverlay(false));
+    ui.sessionsRefresh.addEventListener("click", loadSessions);
+    ui.sessionsOverlay.addEventListener("click", (e) => { if (e.target === ui.sessionsOverlay) showOverlay(false); });
+    // 布局
+    ui.layoutReset.addEventListener("click", () => {
+      state = L.defaultState();
+      saveState();
+      syncRegionToggles();
+      applyLayout();
+      log("布局已恢复默认（可见性 + 比例）", "dim");
+    });
+    ui.runSelftest.addEventListener("click", () => { runSelftest(); });
+    ui.selftestClose.addEventListener("click", () => ui.selftestReport.classList.remove("open"));
+    ui.selftestCopy.addEventListener("click", () => copyText(ui.selftestJson.textContent, "自检 JSON"));
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (ui.selftestReport.classList.contains("open")) ui.selftestReport.classList.remove("open");
+      else if (ui.sessionsOverlay.classList.contains("open")) showOverlay(false);
+    });
+    window.addEventListener("resize", () => applyLayout());
+    if (typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(() => applyLayout()).observe(appEl);
+    }
 
     // 显示批次：节奏由 core 的批量策略决定（≥8 KiB 或 ≥30 ms）；
     // `wall_ms` 由后端用 core 的会话起点精确换算，前端不做任何近似。
     listen("session-batch", (event) => onBatch(event.payload)).catch((e) => {
-      log(`事件订阅失败（接收区将不会有数据）：${e}`, "err");
+      log("事件订阅失败（接收区将不会有数据）：" + e, "err");
     });
 
+    syncRegionToggles();
     setRunning(false);
+    updateFpHint();
+    applyLayout();
     refreshPorts();
     refreshStats();
     setInterval(refreshStats, 500);
+
+    // 自检入口：同一份 DOM/CSS，加 URL 参数即可（index.html?selftest=1）
+    if (new URLSearchParams(window.location.search).get("selftest") === "1") {
+      runSelftest().then((r) => console.log("布局自检：" + r.verdict));
+    }
   </script>
 </body>
 

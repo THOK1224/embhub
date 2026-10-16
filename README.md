@@ -3,7 +3,7 @@
 面向嵌入式开发的桌面集成工具：把**串口调试**、**SSH/SFTP**、**Git** 放进同一条工作流，
 并把每份日志与**当时运行的固件指纹**（commit + dirty + bin hash）绑定起来。
 
-> **当前状态：Phase 0 已通过；Phase 1 增量 A、B1、B2、C1、C2a、C2b、F1、F2 已验收。当前目标：串口助手基本功能。**
+> **当前状态：Phase 0 已通过；Phase 1 增量 A、B1、B2、C1、C2a、C2b、F1、F2、G1、G2 已验收。当前目标：Git 溯源（日志→commit 定位）。**
 > ✅ **Phase 0 全部通过**：Rust 工具链、MSVC 链接、Tauri v2 编译、WebView2 就位、窗口正常打开、**插拔串口后列表能刷新**、**115200 下能收到板子发来的真实数据**。
 > ✅ 增量 A：`ByteSource` + `LogStore` + `cli selftest`（零丢失闭环）。证据见 [`LOG.md`](LOG.md) 第 5 轮。
 > ✅ 增量 B1：`fingerprint` 固件指纹采集 + 自实现 SHA-256（bin_hash 与 Windows `Get-FileHash` 交叉校验一致）。证据见 [`LOG.md`](LOG.md) 第 7 轮。
@@ -12,7 +12,7 @@
 > ✅ 增量 C2a：**发送能力 `ByteSink` + `Session` 最小实现 + `cli send`/`loopback`**。`loopback --bytes 1000000` 证明「写入 == 读回 == 落盘 == 回放」。证据见 [`LOG.md`](LOG.md) 第 10 轮。
 > ✅ 增量 C2b：**GUI 串口助手面板**（打开/关闭会话、接收区文本↔HEX、发送区文本/HEX + 追加 CR/LF/CRLF、RX/TX/显示丢弃 计数）。captain 验到「能编译 + 命令/事件/元素 id 接线对称 + 适配层 8 个单测」，**交互部分无人点过**（沙箱内 WebView2 起不来），已移交为 G1–G7 用户验收项。证据见 [`LOG.md`](LOG.md) 第 11 轮。
 > ⚠️ **待你验**：`.\scripts\accept.ps1` 跑自动项（19 条）＋ [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) 第 3 节的 **G1–G10**（含**真机发送**、**串口参数真机生效**、**定时发送停止后不再发**）。
-> 全项目测试基线：**core 76 + cli 27 + app 17 = 120 passed**；`clippy -D warnings` 与 `fmt --check` 干净。
+> 全项目测试基线：**core 89 + cli 34 + app 31 = 154 passed**，另有**布局求解器 28 项**（`node crates\embhub-app\ui\layout.test.js`，纯函数、无需浏览器）；一键验收 `scripts\accept.ps1`（20 项）**20 passed / 0 failed**；`clippy -D warnings` 与 `fmt --check` 干净。
 
 ---
 
@@ -115,6 +115,57 @@ cargo run -p embhub-app                      # 启动 spike 窗口
   取不到的字段用 `Field<T> { Value(T), Missing(String) }` 表示——**「看着有指纹、其实是空的」在类型上不成立**。
 - `embhub-core::sha256` —— 自实现的流式 SHA-256（纯 std，**零新增第三方依赖**），与 Windows `Get-FileHash` 在真实文件上逐字符一致。
 - `embhub-cli fingerprint --repo <dir> [--bin <file>]` —— 打印全部字段，缺失字段打印原因并汇总清单；采集失败仍以 0 退出（**不是命令失败**），仅缺 `--repo` 时以 1 退出。
+
+**Phase 1 增量 H1b：区域交互（已验收，像素级待你验）**
+
+- **每区开关键 + 全局「区域」重开入口**：关闭按钮由区域表的 `closable` 驱动；参数区的「区域」块列出全部四个区域（常驻区域勾选框禁用并写明原因）——**关掉的一定能重新打开**。**最后一个可见区域关不掉**：关闭前过纯函数 `canHide()`，拒绝时把原因显示在事件区（**不静默失败**）。
+- **分隔条拖拽**：分隔条是**占一条 Grid 轨道的真实元素**（`n-1` 条，轨道交错为「孩子,间隙,孩子…」且 `gap: 0`）⇒ **仍然零绝对定位**。拖拽数学全在纯函数 `resizePair()`：**等量反向、双侧最小值 clamp、到极限停住**（回报 `clamped`）；页面只把真实 pointer/mouse 位移交给它。
+- **双击分隔条**恢复该容器默认比例；另有「恢复默认布局」按钮。
+- **每次交互后持久化** `{visible, ratios, sizes}`（坏数据全部回退）。
+- **harness 已覆盖交互路径（真事件驱动）**：36 个布局状态 + **14 个交互动作**（拖到正负极限、逐区关闭再重开、尝试关常驻区、双击复位），复用同一套不变量并新增 `pair-isolation`（只动相邻一对、**其它容器轨道一字不变**）、`reopen-failed`、`guard-failed`。
+- **布局闸门 70 条断言**（t17 旧闸门 10 条 → t23 重写 28 条 → t24 45 条 → t27 55 条 → t29 70 条）。其中三条特别值得一提：
+  - **真算 CSS 特异性**（`css_specificity` + `hidden_display_none_rule`，且先剥离注释）：确保存在一条盖得住 `.region` 的 `[hidden] { display: none }` 规则——**这正是曾经导致"关掉一个区域后布局错位塌缩"的根因**（`.region { display: flex }` 与 UA 的 `[hidden]` 同特异性、作者样式优先）。
+  - **双向反作弊**：把每段 `skipped.push(` 抓出来，**11 条**不变量（7 条核心 + `region-clipped` + 三条交互规则）**既不许消失、也不许被标成跳过**。变红证据可复跑：`python target\tmp\gate-red-check-t29.py`。
+  - **禁止 `#app` 回退成多列静态模板**：静态兜底必须是单格 `100%`（真实轨道每次由 `applyLayout()` 写入）——曾经的 `300px 1fr` 会与"`#app` 只有一个孩子"的结构矛盾，把右侧整块裁掉。
+
+**Phase 1 增量 H1a：区域化布局内核（已验收，像素级待你验）**
+
+界面从"一列 flex 块互相协商高度"换成**区域对象 + 分割树求解 + CSS Grid**：
+
+- `ui/layout.js` —— **纯函数求解器**（不碰 DOM，Node 与浏览器共用一份）：唯一区域表 `params`（左列）/`tx`/`rx`/`events`（右列纵排），每区有 `minW/minH/weight/closable/defaultVisible`；`solve()` 每层**先扣除所有子节点最小值、剩余按权重分配**，**任一区域永不低于其最小值**，只剩一个孩子则**塌缩**、空间被兄弟吸收。返回 `{rects, tracks, collapsed, minSize, overflow}`。
+- 布局根 `#app` 是 **Grid**，轨道由求解结果写成显式 px（**不用绝对定位**）；每个区域 `.region` 强制 `overflow: hidden` + `min-width/height: 0`（**尺寸绝不随内容变化**），内部 `.region-body` 自己滚动；可见性与比例记到 `localStorage`（坏数据回退，不崩）。
+- **小窗口兜底**：窗口小于「所有可见区域最小值之和」时，区域停在各最小值不再缩小，由整页滚动访问——**宁可滚动，也不重叠、不把区域压没**。
+- **页内 harness**（`?selftest=1` 或 app 内「跑布局自检」按钮）：枚举 **9 尺寸 × 4 可见性组合 = 36 状态**，逐状态断言「可见区域两两不相交 / 内容不越出盒子 / 关键控件 `elementFromPoint` 命中自己 / 每区 ≥ 最小值 / 无非预期横向滚动」，输出 PASS/FAIL + **可复制 JSON（含失败状态的最小复现）**。它**先存后还、只测量**。
+
+  ```powershell
+  # 布局求解器（纯函数，不需要浏览器；这条我和维护者都能独立跑）
+  node crates\embhub-app\ui\layout.test.js
+
+  # 像素级不变量（需要真实浏览器）
+  & 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' 'file:///C:/Users/24928/Documents/deepseek-harness/Integrated%20Tool/crates/embhub-app/ui/index.html?selftest=1'
+  ```
+
+> ⚠️ **像素级结论尚未由人验证**（沙箱内 WebView2 与 headless Edge 均被拦）。求解器数学已由 captain 用 12 尺寸 × 全 16 种可见性组合 = **192 状态**独立扫描验证（0 失败）；「DOM 渲染是否忠实于求解结果」需你跑上面的 harness（G15）。
+
+**Phase 1 增量 G2：GUI 指纹采集与日志列表（已验收，交互待你验）**
+
+- 打开会话时可填**仓库路径**与可选的 **bin 文件**：填了就调 core 的 `fingerprint::collect` 采集并写进 v2 会话头；界面显示 **40 位 commit / dirty / bin_hash**。
+  - **打开后是回读磁盘会话头再展示**（不是显示"打算写入的值"）；回读失败会退回写入值并附 `fingerprint_note` 显式告警。
+  - **未填仓库路径时，参数区逐字提示「本会话日志将不包含固件指纹」**，打开后状态行明示未采集与 core 的原因——**不静默产生无指纹日志**（这条有永久闸门 `ui_states_that_a_session_without_repo_has_no_fingerprint`）。
+- **日志列表**：浮层列出历史会话（起始时间 / 来源配置 / 字节数 / 指纹摘要 / 坏会话 ⚠ 原因 / `skipped` 逐条），每项可**复制 commit** 与复制日志路径；空目录显示「没有会话」。
+  - 浮层用 `position: fixed`，**不参与 flex 分配**，因此不会重现 t17 那个"挤压下方区域"的缺陷（相关 id 也纳入了布局闸门）。
+- **绝不碰你的仓库**（用户明确要求）：只显示/复制 commit，不执行 `checkout`/`switch`/`reset`。这条由永久闸门 `app_never_mutates_the_repository` 机器化保证。
+- 顺手修掉 t19 发现的缺陷：来源配置缺分隔符（曾落盘为 `serial:COM14@1152008N1 无流控`），现有精确等式闸门 `source_config_separates_baud_from_frame` 防复发。
+
+**Phase 1 增量 G1：会话列举 —— 日志 ↔ 固件指纹（已验收）**
+
+- `embhub-core::store::list_sessions(root)` —— 扫描会话根目录，返回结构化摘要：**会话 id、起始墙上时间、来源配置、固件指纹（已采集/未采集+原因/头不可读）、payload 字节数、记录数、分片数、问题原因**。
+  - **总函数**（返回类型里没有 `Err`）：根目录问题 → `rootProblem`、单会话问题 → 各自 `problem`、非目录条目 → `skipped`（带原因）。**一个坏会话绝不会让好会话消失**，且错误原因随数据返回而非被吞。
+  - 字节数按记录头 `seek` 扫描（**不读 payload、不校验 CRC**）：列目录不怕大日志；坏会话也能报出字节数。
+- `embhub-cli sessions --root <dir> [--json]` —— 人类可读（含 UTC 时间与原始 ms）或 JSON（`{root, rootProblem, sessions[], skipped[]}`）。**除参数错外退码恒为 0**：目录不存在也只是空结果 + 说明。
+  ```
+  .\scripts\cargo.cmd run --quiet -p embhub-cli -- sessions --root target\debug\embhub-data\sessions
+  ```
 
 **Phase 1 增量 F1/F2：串口参数、时间戳、定时发送（已验收，交互待你验）**
 

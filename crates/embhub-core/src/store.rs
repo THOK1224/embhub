@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -69,6 +69,8 @@ pub const V1_FINGERPRINT_PLACEHOLDER_LEN: usize = 32;
 const MAX_FINGERPRINT_SECTION_LEN: u32 = 1 << 20;
 /// 未采集指纹时写进头的默认原因（不允许静默省略）。
 pub const FINGERPRINT_NOT_COLLECTED: &str = "会话创建时未提供固件指纹（未采集）";
+/// 会话头文件名（每个会话目录一份）。
+pub const HEADER_FILE: &str = "header.bin";
 /// 记录头长度：t_mono(8) + len(4) + crc32(4)。落盘校验（文件字节数对账）也用得上。
 pub const RECORD_HEADER_LEN: u64 = 16;
 /// 单条记录 payload 的 sanity 上限（防篡改出的离谱长度把内存读爆）。
@@ -253,7 +255,7 @@ const V2_FIXED_PREFIX_LEN: usize = 8 + 4 + 8 + 4;
 
 /// 读取并校验会话头。magic 错、版本不认识（含已废弃的 v1）、截断、指纹段解析失败都会报错。
 pub fn read_session_header(session_dir: &Path) -> Result<SessionHeader, StoreError> {
-    let raw = fs::read(session_dir.join("header.bin"))?;
+    let raw = fs::read(session_dir.join(HEADER_FILE))?;
     if raw.len() < V2_FIXED_PREFIX_LEN {
         return Err(StoreError::BadHeader(format!(
             "header.bin 太短: {} < {V2_FIXED_PREFIX_LEN}",
@@ -394,7 +396,7 @@ impl LogStore {
         header.extend_from_slice(&fp_json); // 长度前缀的指纹段（v2 起取代 32 字节占位）
         header.extend_from_slice(&(meta.source_config.len() as u32).to_le_bytes());
         header.extend_from_slice(meta.source_config.as_bytes());
-        fs::write(dir.join("header.bin"), &header)?;
+        fs::write(dir.join(HEADER_FILE), &header)?;
 
         self.writers.lock().unwrap().insert(
             id.0.clone(),
@@ -513,6 +515,296 @@ impl LogStore {
             closed: false,
             header: Some(header),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 会话列举（list_sessions）——不依赖 GUI 就能把「日志 ↔ 固件指纹」对上账
+// ---------------------------------------------------------------------------
+
+/// 会话根目录下被跳过的条目（不是目录），带原因——**不静默吞掉**。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedEntry {
+    /// 条目名。
+    pub name: String,
+    /// 为什么跳过它。
+    pub reason: String,
+}
+
+/// 一个会话目录的摘要。
+///
+/// **坏会话也在这份列表里**（带 [`SessionSummary::problem`]），不会被丢掉：
+/// 「因为一个坏会话就把其它会话藏起来」正是列举功能最不该犯的错。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    /// 会话 id（目录名）。
+    pub id: String,
+    /// 会话目录的完整路径。
+    pub dir: PathBuf,
+    /// 起始墙上时钟（Unix epoch 毫秒）。头坏了就是 `None`（原因见 `problem`）。
+    pub start_wall_ms: Option<u64>,
+    /// 来源配置（如 `serial:COM14@115200`）。
+    pub source_config: Option<String>,
+    /// 固件指纹段：已采集 → 含 8 个字段；未采集 → `not_collected` 带**原因**。
+    /// 头都没读到时是 `None`（这和「读到了头、但当时没采集」是两件不同的事，不能混）。
+    pub fingerprint: Option<FingerprintSection>,
+    /// 日志 payload 字节数（不含记录头与会话头）。
+    pub payload_bytes: u64,
+    /// 记录条数。
+    pub records: u64,
+    /// 分片文件数。
+    pub segments: u64,
+    /// 这个会话哪里有问题（`None` = 头合法且分片干净）。
+    pub problem: Option<String>,
+}
+
+impl SessionSummary {
+    /// 完全可读（头合法、分片无异常）。
+    pub fn is_ok(&self) -> bool {
+        self.problem.is_none()
+    }
+}
+
+/// 会话列举结果：**总是不失败**。
+///
+/// 根目录本身的问题放 [`SessionList::root_problem`]（目录不存在 / 不是目录 / 读不进去），
+/// 单个会话的问题放各自的 [`SessionSummary::problem`]——这样 CLI 永远能退 0，
+/// 而「一个会话坏了」不会连累别的会话。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionList {
+    /// 被扫描的根目录。
+    pub root: PathBuf,
+    /// 根目录的问题（`None` = 正常读到）。
+    pub root_problem: Option<String>,
+    /// 每个会话目录一条（含坏会话）。
+    pub sessions: Vec<SessionSummary>,
+    /// 根目录下不是目录的条目（跳过，但列出来）。
+    pub skipped: Vec<SkippedEntry>,
+}
+
+impl SessionList {
+    /// 会话总数（含坏会话）。
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// 一个会话都没有。
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// 完全可读的会话数。
+    pub fn ok_count(&self) -> usize {
+        self.sessions.iter().filter(|s| s.is_ok()).count()
+    }
+
+    /// 有问题的会话数。
+    pub fn broken_count(&self) -> usize {
+        self.sessions.iter().filter(|s| !s.is_ok()).count()
+    }
+}
+
+/// 扫描会话根目录，为每个会话目录产出一条摘要。**不返回 `Result`，也不 panic。**
+///
+/// 健壮性契约（增量 G1）：根目录不存在、空目录、混入非会话条目、缺 `header.bin`、
+/// magic 错、v1、未知未来版本、header 截断——一律不 panic，而且
+/// **一个坏会话绝不会让别的会话消失**：坏会话照样出现在 `sessions` 里，只是带上
+/// `problem` 说明原因；不是目录的条目出现在 `skipped` 里，同样带原因。
+pub fn list_sessions(root: impl AsRef<Path>) -> SessionList {
+    let root = root.as_ref().to_path_buf();
+    let mut list = SessionList {
+        root: root.clone(),
+        root_problem: None,
+        sessions: Vec::new(),
+        skipped: Vec::new(),
+    };
+
+    let entries = match fs::read_dir(&root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            list.root_problem = Some(format!("读不到会话根目录 {}: {e}", root.display()));
+            return list;
+        }
+    };
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                list.skipped.push(SkippedEntry {
+                    name: "?".to_string(),
+                    reason: format!("目录项读取失败: {e}"),
+                });
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => dirs.push(entry.path()),
+            Ok(_) => list.skipped.push(SkippedEntry {
+                name,
+                reason: "不是目录（会话是根目录下的子目录）".to_string(),
+            }),
+            Err(e) => list.skipped.push(SkippedEntry {
+                name,
+                reason: format!("取文件类型失败: {e}"),
+            }),
+        }
+    }
+
+    // 按目录名排序：列举结果必须稳定可复现（便于脚本 diff）。
+    dirs.sort();
+    for dir in dirs {
+        list.sessions.push(summarize_session_dir(&dir));
+    }
+    list
+}
+
+/// 汇总单个会话目录。**任何一步失败都只影响这一条**，不会向上传播错误。
+fn summarize_session_dir(dir: &Path) -> SessionSummary {
+    let id = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // 分片先扫（头坏了也要给出「到底有多少字节」——用户最关心的是数据在不在）。
+    let (payload_bytes, records, segments, seg_problem) = scan_segments(dir);
+
+    let mut summary = SessionSummary {
+        id,
+        dir: dir.to_path_buf(),
+        start_wall_ms: None,
+        source_config: None,
+        fingerprint: None,
+        payload_bytes,
+        records,
+        segments,
+        problem: None,
+    };
+
+    // 「缺 header.bin」是列举时最常见的一种「不是会话目录」。单独说清楚，
+    // 而不是把底层那句「系统找不到指定的文件」直接甩给用户。
+    if !dir.join(HEADER_FILE).exists() {
+        summary.problem = Some(with_segment_note(
+            format!("缺少 {HEADER_FILE}（不是会话目录，或会话目录被破坏）"),
+            seg_problem,
+        ));
+        return summary;
+    }
+
+    match read_session_header(dir) {
+        Ok(header) => {
+            summary.start_wall_ms = Some(header.start_wall_ms);
+            summary.source_config = Some(header.source_config);
+            summary.fingerprint = Some(header.fingerprint);
+            // 头对、分片有问题（例如崩溃留下的半截记录）：如实标出，不假装干净。
+            summary.problem = seg_problem;
+        }
+        Err(e) => {
+            summary.problem = Some(with_segment_note(e.to_string(), seg_problem));
+        }
+    }
+    summary
+}
+
+/// 把「分片侧的备注」挂到主原因后面，不覆盖主原因。
+fn with_segment_note(main: impl Into<String>, seg_problem: Option<String>) -> String {
+    match seg_problem {
+        Some(seg) => format!("{}（另外分片也有问题: {seg}）", main.into()),
+        None => main.into(),
+    }
+}
+
+/// 分片文件名判定：`seg-000001.bin`。
+fn is_segment_file(name: &str) -> bool {
+    name.starts_with("seg-") && name.ends_with(".bin")
+}
+
+/// 尽力统计分片里的 payload 字节数 / 记录条数 / 分片数。
+///
+/// 只按记录头往前跳（**不读 payload、不校验 CRC**）——列举要快；
+/// 逐条 CRC 的深度校验留给回放（`open_replay`）与 `selftest`。
+/// 遇到截断/越界就停下并把原因交出去，绝不 panic、绝不假装干净。
+fn scan_segments(dir: &Path) -> (u64, u64, u64, Option<String>) {
+    let mut segments: Vec<PathBuf> = Vec::new();
+    match fs::read_dir(dir) {
+        Ok(rd) => {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_segment_file(&name) {
+                    segments.push(entry.path());
+                }
+            }
+        }
+        Err(e) => return (0, 0, 0, Some(format!("读会话目录失败: {e}"))),
+    }
+    // 分片序号是零填充的，字典序即序号序。
+    segments.sort();
+    let segment_count = segments.len() as u64;
+
+    let mut payload_bytes = 0u64;
+    let mut records = 0u64;
+    for path in &segments {
+        if let Err(msg) = scan_one_segment(path, &mut payload_bytes, &mut records) {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            return (
+                payload_bytes,
+                records,
+                segment_count,
+                Some(format!("{name}: {msg}")),
+            );
+        }
+    }
+    (payload_bytes, records, segment_count, None)
+}
+
+/// 走一遍单个分片：只读 16 字节记录头，然后 `seek` 跳过 payload。
+fn scan_one_segment(path: &Path, payload_bytes: &mut u64, records: &mut u64) -> Result<(), String> {
+    let file = File::open(path).map_err(|e| format!("打开失败: {e}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("取文件长度失败: {e}"))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut pos = 0u64;
+
+    loop {
+        let left = file_len - pos;
+        if left == 0 {
+            return Ok(()); // 干净结束
+        }
+        if left < RECORD_HEADER_LEN {
+            return Err(format!("尾部有 {left} 字节的半截记录头"));
+        }
+        let mut hdr = [0u8; RECORD_HEADER_LEN as usize];
+        reader
+            .read_exact(&mut hdr)
+            .map_err(|e| format!("读记录头失败: {e}"))?;
+        pos += RECORD_HEADER_LEN;
+
+        let len = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        if len > MAX_RECORD_LEN {
+            return Err(format!("记录长度越界: {len}（疑似损坏）"));
+        }
+        let len = len as u64;
+        if file_len - pos < len {
+            return Err(format!(
+                "记录 payload 截断: 还缺 {} 字节",
+                len - (file_len - pos)
+            ));
+        }
+        reader
+            .seek(io::SeekFrom::Current(len as i64))
+            .map_err(|e| format!("跳过 payload 失败: {e}"))?;
+        pos += len;
+        *payload_bytes += len;
+        *records += 1;
     }
 }
 
@@ -1261,5 +1553,376 @@ mod tests {
             !manifest.to_lowercase().contains("tauri"),
             "embhub-core 的 Cargo.toml 不允许出现 tauri"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 会话列举（增量 G1）
+    // -----------------------------------------------------------------------
+
+    /// 造一个「好会话」：写头 + 注入若干字节 + seal。
+    fn make_good_session(
+        root: &Path,
+        tag_meta: &SessionMeta,
+        chunks: &[usize],
+    ) -> (SessionId, u64) {
+        let store = LogStore::new(root, 4096);
+        let id = store.create_session(tag_meta).unwrap();
+        let mut total = 0u64;
+        for (i, n) in chunks.iter().enumerate() {
+            let payload = vec![0xA0 + i as u8; *n];
+            store
+                .append(
+                    &id,
+                    &Chunk {
+                        t_mono: (i as u64 + 1) * 1000,
+                        payload: &payload,
+                    },
+                )
+                .unwrap();
+            total += *n as u64;
+        }
+        store.seal(&id).unwrap();
+        (id, total)
+    }
+
+    fn only_session(list: &SessionList, id: &str) -> SessionSummary {
+        list.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("结果里必须有会话 {id}: {list:?}"))
+            .clone()
+    }
+
+    #[test]
+    fn list_sessions_on_missing_root_is_not_an_error() {
+        let root = temp_root("list-missing");
+        let ghost = root.join("definitely-not-here");
+        assert!(!ghost.exists());
+        // 关键：不 panic、不返回 Err（返回类型本身没有 Err）。
+        let list = list_sessions(&ghost);
+        assert!(list.is_empty(), "根目录不存在时不该有会话");
+        assert!(
+            list.root_problem
+                .as_deref()
+                .unwrap_or("")
+                .contains("读不到"),
+            "必须说明根目录的问题: {:?}",
+            list.root_problem
+        );
+        assert!(list.skipped.is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_on_empty_root_reports_nothing() {
+        let root = temp_root("list-empty");
+        let list = list_sessions(&root);
+        assert!(
+            list.root_problem.is_none(),
+            "空目录不是问题: {:?}",
+            list.root_problem
+        );
+        assert!(list.is_empty());
+        assert_eq!(list.ok_count(), 0);
+        assert_eq!(list.broken_count(), 0);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_marks_non_session_dir_and_skips_files() {
+        let root = temp_root("list-stray");
+        fs::write(root.join("readme.txt"), b"not a session").unwrap();
+        fs::create_dir_all(root.join("not-a-session")).unwrap();
+
+        let list = list_sessions(&root);
+        // 文件被跳过，但**带原因列出来**，不静默吞掉。
+        assert_eq!(list.skipped.len(), 1, "{list:?}");
+        assert_eq!(list.skipped[0].name, "readme.txt");
+        assert!(!list.skipped[0].reason.is_empty());
+        // 目录名虽不像会话，也照样出现在列表里（带原因），而不是被丢掉。
+        assert_eq!(list.sessions.len(), 1, "{list:?}");
+        let s = only_session(&list, "not-a-session");
+        assert!(!s.is_ok());
+        assert!(
+            s.problem.as_deref().unwrap_or("").contains("header.bin"),
+            "缺 header.bin 要说明原因: {:?}",
+            s.problem
+        );
+        assert_eq!(s.payload_bytes, 0);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_marks_missing_header() {
+        let root = temp_root("list-no-header");
+        fs::create_dir_all(root.join("s-empty")).unwrap();
+        let list = list_sessions(&root);
+        let s = only_session(&list, "s-empty");
+        assert!(!s.is_ok());
+        assert!(s.start_wall_ms.is_none() && s.source_config.is_none());
+        assert!(
+            s.fingerprint.is_none(),
+            "头都读不到时指纹必须是 None（与「读到头但没采集」区分开）"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_marks_bad_magic() {
+        let root = temp_root("list-bad-magic");
+        let dir = root.join("s-bad-magic");
+        fs::create_dir_all(&dir).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"NOTEMBHU");
+        raw.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        raw.extend_from_slice(&1_700_000_000_000u64.to_le_bytes());
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(b"{}");
+        fs::write(dir.join("header.bin"), &raw).unwrap();
+
+        let list = list_sessions(&root);
+        let s = only_session(&list, "s-bad-magic");
+        assert!(
+            s.problem.as_deref().unwrap_or("").contains("magic"),
+            "要点明 magic 不匹配: {:?}",
+            s.problem
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_marks_v1_with_upgrade_hint() {
+        let root = temp_root("list-v1");
+        let dir = root.join("s-v1");
+        fs::create_dir_all(&dir).unwrap();
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&HEADER_MAGIC);
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&1_700_000_000_000u64.to_le_bytes());
+        v1.extend_from_slice(&[0u8; V1_FINGERPRINT_PLACEHOLDER_LEN]);
+        v1.extend_from_slice(&4u32.to_le_bytes());
+        v1.extend_from_slice(b"v1cfg");
+        fs::write(dir.join("header.bin"), &v1).unwrap();
+
+        let list = list_sessions(&root);
+        let s = only_session(&list, "s-v1");
+        let problem = s.problem.clone().unwrap_or_default();
+        assert!(problem.contains("v1"), "{problem}");
+        assert!(problem.contains("v2"), "要给出可行动的升级提示: {problem}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_marks_unknown_future_version() {
+        let root = temp_root("list-future");
+        let dir = root.join("s-future");
+        fs::create_dir_all(&dir).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&HEADER_MAGIC);
+        raw.extend_from_slice(&99u32.to_le_bytes()); // 未来版本
+        raw.extend_from_slice(&1_700_000_000_000u64.to_le_bytes());
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(b"{}");
+        fs::write(dir.join("header.bin"), &raw).unwrap();
+
+        let list = list_sessions(&root);
+        let s = only_session(&list, "s-future");
+        let problem = s.problem.clone().unwrap_or_default();
+        assert!(problem.contains("不支持的格式版本"), "{problem}");
+        assert!(problem.contains("99"), "{problem}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_marks_truncated_header() {
+        let root = temp_root("list-truncated");
+        let dir = root.join("s-trunc");
+        fs::create_dir_all(&dir).unwrap();
+        // 只有 10 字节：连固定前缀都不够。
+        let mut raw = HEADER_MAGIC.to_vec();
+        raw.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        fs::write(dir.join("header.bin"), &raw).unwrap();
+
+        let list = list_sessions(&root);
+        let s = only_session(&list, "s-trunc");
+        assert!(
+            s.problem.as_deref().unwrap_or("").contains("太短"),
+            "要点明 header 太短: {:?}",
+            s.problem
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 最要紧的一条：**好会话不能因为旁边有坏会话而消失**。
+    #[test]
+    fn list_sessions_keeps_good_sessions_next_to_bad_ones() {
+        let root = temp_root("list-mixed");
+        // 好会话（带指纹）。
+        let good_meta = SessionMeta::with_fingerprint("serial:COM14@115200", full_fingerprint());
+        let (good_id, good_bytes) = make_good_session(&root, &good_meta, &[1000, 2000, 3000]);
+
+        // 四种坏会话 + 一个游离文件。
+        fs::create_dir_all(root.join("bad-no-header")).unwrap();
+        let bad_magic = root.join("bad-magic");
+        fs::create_dir_all(&bad_magic).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"XXXXXXXX");
+        raw.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 8]);
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(b"{}");
+        fs::write(bad_magic.join("header.bin"), &raw).unwrap();
+        let v1 = root.join("bad-v1");
+        fs::create_dir_all(&v1).unwrap();
+        let mut v1raw = Vec::new();
+        v1raw.extend_from_slice(&HEADER_MAGIC);
+        v1raw.extend_from_slice(&1u32.to_le_bytes());
+        v1raw.extend_from_slice(&[0u8; 8 + V1_FINGERPRINT_PLACEHOLDER_LEN + 4]);
+        fs::write(v1.join("header.bin"), &v1raw).unwrap();
+        let trunc = root.join("bad-trunc");
+        fs::create_dir_all(&trunc).unwrap();
+        fs::write(trunc.join("header.bin"), b"EMB").unwrap();
+        fs::write(root.join("stray.txt"), b"x").unwrap();
+
+        let list = list_sessions(&root);
+        assert_eq!(list.len(), 5, "5 个目录都要出现: {list:?}");
+        assert_eq!(list.broken_count(), 4, "四个坏会话都要带 problem: {list:?}");
+        assert_eq!(list.ok_count(), 1);
+        assert_eq!(list.skipped.len(), 1, "游离文件要被记录: {list:?}");
+
+        // 好会话的每个字段都对得上（**没有被坏会话连累**）。
+        let good = only_session(&list, &good_id.0);
+        assert!(good.is_ok(), "好会话必须干净: {:?}", good.problem);
+        assert_eq!(good.payload_bytes, good_bytes);
+        assert_eq!(good.records, 3);
+        assert!(good.segments >= 1);
+        assert_eq!(good.source_config.as_deref(), Some("serial:COM14@115200"));
+        assert!(good.start_wall_ms.unwrap() > 1_600_000_000_000);
+        let fp = good
+            .fingerprint
+            .as_ref()
+            .and_then(|s| s.collected.as_ref())
+            .expect("指纹必须读回来");
+        assert_eq!(fp, &full_fingerprint(), "指纹必须无损读回");
+
+        // 坏会话各自带各自的 reason（不是一句笼统的「读取失败」）。
+        for (name, needle) in [
+            ("bad-no-header", "header.bin"),
+            ("bad-magic", "magic"),
+            ("bad-v1", "v1"),
+            ("bad-trunc", "太短"),
+        ] {
+            let s = only_session(&list, name);
+            let problem = s.problem.clone().unwrap_or_default();
+            assert!(
+                problem.contains(needle),
+                "{name} 的原因应含 {needle}: {problem}"
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_counts_payload_bytes_across_segments() {
+        let root = temp_root("list-bytes");
+        // 分片上限 4096：每条 1500 字节的记录各自成片，逼出多分片路径。
+        let store = LogStore::new(&root, 4096);
+        let id = store.create_session(&meta()).unwrap();
+        let payload = vec![0x5A; 1500];
+        for i in 0..5u64 {
+            store
+                .append(
+                    &id,
+                    &Chunk {
+                        t_mono: i * 100,
+                        payload: &payload,
+                    },
+                )
+                .unwrap();
+        }
+        store.seal(&id).unwrap();
+
+        let list = list_sessions(&root);
+        let s = only_session(&list, &id.0);
+        assert!(s.is_ok(), "刚写完的会话必须干净: {:?}", s.problem);
+        assert_eq!(s.payload_bytes, 1500 * 5, "payload 字节数要跨分片累加");
+        assert_eq!(s.records, 5);
+        assert!(
+            s.segments > 1,
+            "这条用例应该产生多个分片，实际 {}",
+            s.segments
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_reports_not_collected_reason_for_plain_session() {
+        let root = temp_root("list-no-fp");
+        let (id, _) = make_good_session(&root, &meta(), &[64]);
+        let list = list_sessions(&root);
+        let s = only_session(&list, &id.0);
+        let section = s
+            .fingerprint
+            .as_ref()
+            .expect("必须带指纹段（哪怕是未采集）");
+        assert!(section.collected.is_none());
+        assert_eq!(
+            section.not_collected.as_deref(),
+            Some(FINGERPRINT_NOT_COLLECTED),
+            "未采集必须带原因，不得留空"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_reports_corrupt_segment_tail_without_losing_the_prefix() {
+        let root = temp_root("list-corrupt-tail");
+        let (id, total) = make_good_session(&root, &meta(), &[500, 500]);
+        // 追加半截记录头（模拟崩溃留下的尾巴）。
+        let seg = root.join(&id.0).join("seg-000000.bin");
+        let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
+        f.write_all(&[0u8; 5]).unwrap();
+        f.flush().unwrap();
+        drop(f);
+
+        let list = list_sessions(&root);
+        let s = only_session(&list, &id.0);
+        assert!(!s.is_ok(), "尾部损坏必须被标出来");
+        let problem = s.problem.clone().unwrap_or_default();
+        assert!(problem.contains("半截记录头"), "{problem}");
+        assert_eq!(
+            s.payload_bytes, total,
+            "已经数到的有效字节不能因为尾巴坏了就丢掉"
+        );
+        assert_eq!(s.records, 2);
+        // 头仍然是可读的（分片问题不影响元数据）。
+        assert_eq!(
+            s.source_config.as_deref(),
+            Some(meta().source_config.as_str())
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_output_is_sorted_and_serializable() {
+        let root = temp_root("list-sorted");
+        for name in ["s-b", "s-a", "s-c"] {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("header.bin"), b"junk").unwrap();
+        }
+        let list = list_sessions(&root);
+        let ids: Vec<&str> = list.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["s-a", "s-b", "s-c"], "列举结果必须按 id 稳定排序");
+
+        // 可以直接被脚本消费（serde_json 是 core 已有的依赖）。
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(
+            json.contains("\"rootProblem\""),
+            "JSON 用 camelCase: {json}"
+        );
+        assert!(json.contains("\"payloadBytes\""));
+        assert!(json.contains("s-a"));
+        fs::remove_dir_all(&root).ok();
     }
 }

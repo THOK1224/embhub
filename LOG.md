@@ -4,6 +4,268 @@
 
 ---
 
+## 2026-10-16 · 第 22 轮：真实 app 右侧整块被裁（RC1）+ harness 两条盲区（RC2），已修
+
+### 用户实测现象
+
+harness **PASS**（44 状态 0 失败、跳过项只两条且带原因），但**真实 app 里除参数区外全是黑的，且用鼠标拖不动分隔条**。
+
+### 定性（靠用户提供的 DevTools 数据，不是猜）
+
+```
+appKids: [{cls:"split split-cols", rect:[300,700], kids:3}]     ← #app 只有 1 个孩子
+cols: "300px 720px"                                             ← 但模板有 2 条轨道
+regions: params[300,700] tx[712,186] rx[712,337] events[712,162] ← 区域自身 rect 全正常
+```
+
+**RC1（产品真缺陷）**：t23 之后 `#app` 只有一个孩子（根 `.split`），但静态 CSS 仍留着 `grid-template-columns: 300px 1fr` 两列兜底，而 `applyLayout()` **从不写 `#app` 自身的模板** ⇒ 唯一的根分割落入第 1 条轨道（300px），其内部 1020px 宽内容被 `overflow: hidden` **整块裁掉**；第 2 条轨道 720px 是空的（全黑）。**"鼠标拖不动分隔条"是同一根因的后果**——分隔条就在被裁掉的区域里，鼠标够不着，不是原理上做不到。
+
+**captain 的责任**：这个缺陷**从 t23 起就存在**，而 H1a/H1b 两轮我都判了 pass。两级验证都没抓到：**求解器数学**（192 状态 + 4180 断言，全绿）只覆盖数学；**harness** 本身有两条盲区。
+
+**RC2①**：命中检查第 1395 行是 `hit === el || el.contains(hit) || hit.contains(el)`——**`hit.contains(el)` 把"命中的是控件的祖先"也算通过**；而控件被祖先裁剪时 `elementFromPoint` 返回的正是那个祖先 ⇒ **"被裁掉"读成了"没被遮挡"**，44 个状态全部放行。
+**RC2②**：harness 每个状态都先覆写 `#app` 宽高，**从来没测过真实布局**。
+
+### 修复（只改 app 2 个文件）
+
+- **RC1**：选**方案②——让 `#app` 自己就是根节点**（`buildLayoutDom(TREE, appEl, true)`，根不再套一层 `.split`）。理由：方案①仍依赖"静态模板恰好匹配唯一孩子"的约定，结构再变就会重演。现在 `applyLayout()` 写 `root` 的轨道**就是**写 `#app` 的模板，结构上没有第二层可走偏。静态兜底降为单格 `100%`，并**被闸门明文禁止**再出现 `300px 1fr`。
+- **RC2①**：两处命中检查都改为**只接受「自身或其子孙」**，命中祖先即报错，并用 `describeHit()` 点名命中元素。
+- **RC2②**：harness 新增**状态 0 = 真实布局**（不覆写尺寸先测一次）。
+- **新规则**（拆分为两条，captain 裁定同意）：
+  - `region-clipped`（**硬规则**，与视口无关 ⇒ 永不跳过）：区域必须完整落在**每个祖先容器**内——**这是 RC1 的机器判据**（区域自身 rect 正常但被祖先裁剪，是 `overlap`/`box-grown` 看不见的）；
+  - `region-covered`（视口相关，可跳过但必须带原因）：区域∩真实视口的**交集中心**做命中检查，命中祖先即报错。
+  - 拆分理由：`elementFromPoint` 在"区域整块在视口外"时**无点可采**，硬入断跳名单只能在假失败（F2 禁）与静默略过（F2 禁）之间二选一。
+- **反作弊扩容到 11 条**（7 条核心 + `region-clipped` + 三条交互规则），每条**成对**断言「必须存在」+「不许出现在 `skipped.push` 里」——**t27 发现的缺口（三条交互规则只被要求"存在"）已堵**。
+
+### captain 独立验收
+
+- 复跑：app 31 / core 89 / cli 34 / 求解器 28 项；clippy、fmt、build、check 全 0。
+- **源码级核实 RC1**：`buildLayoutDom` 里 `isRoot ? host : createElement("div")` ⇒ 根节点 box 即 `appEl`；旧两列模板仅存注释且被闸门禁止。
+- 读码确认命中检查、`region-clipped`（祖先几何包含）、`region-covered`（交集中心 + 空交集带原因跳过且声明 region-clipped 仍执行）。
+- 逐块抓取闸门 for-rule 名单，确认 **11 条成对断言**。
+- 变红证据复跑：**修复前 RED 23/34 → 修复后 GREEN 34/34**。
+
+### 教训（长期保留）
+
+1. **"PASS" 不等于"没问题"**：harness 的 PASS 曾让我以为布局已被机器守住，而它在真实 app 里是坏的。**验证工具的盲区就是结论的盲区**——本轮之后才补上"能看见祖先裁剪"的检查。
+2. **用户看一眼 > 我的两级自动验证**：这次是用户在界面上发现异常、并用我给他的 console 一行命令给出决定性数据，才定位到根因。**移交给人眼的那部分必须真的交出去，不能因为自动检查全绿就默认它没问题。**
+3. **拿"祖先命中"当通过是通用的盲区模式**：任何"命中自己"的检查都要问一句——**命中的是祖先时算不算通过？** 算了就看不见裁剪与遮挡。
+
+### 待用户
+
+**重启 app**（正在运行的实例 PID 16584 是修复前代码）后确认右侧恢复、分隔条可拖；并重跑 harness（首个状态即真实布局）。
+
+---
+
+## 2026-10-16 · 第 21 轮：G15 harness 抓到真 bug（隐藏区域占轨道位）+ harness 自身视口缺陷，均已修
+
+### 用户跑 G15 → FAIL（44 状态里 39 失败）
+
+captain **没有照着失败清单改**，而是先把失败**分成两类**——这一步是整轮的关键：
+
+**(F1) 产品真缺陷**：`.region { display: flex }` 与浏览器 UA 的 `[hidden] { display: none }` **特异性相同（均 0,1,0）而作者样式优先** ⇒ `el.hidden = true` 只隐藏了语义、**布局上仍是 grid item**；而求解器已按可见性删掉了该孩子的轨道 ⇒ **轨道与 DOM 孩子错位一位**，末尾孩子掉进隐式 `auto` 轨道、塌成数像素。
+
+这正是用户 JSON 里那组诡异数字的来源：`rx 低于最小值：1292x8`、`events client 高 0`、`box-grown（scroll 34 > client 6）`、`paint-out` —— 且**只在隐藏了兄弟的组合里出现，全可见时一条都不报**。
+
+**(F2) harness 方法缺陷**：它拿**真实文档/视口**度量 `h-scroll` 与控件命中。用户窗口约 1025 宽，模拟尺寸 ≥1024 的用例**必然假失败**（`clientWidth` 恒为 1025、`scrollWidth = 模拟宽 + 10`；≤800 的用例一条都不报，高度吻合）。
+
+### **captain 的验证盲区（必须记录）**
+
+captain 在此之前跑的 **192 状态求解器扫描 + 4180 条交互断言全部通过，却没抓到 F1** —— 因为它们只驱动**求解器数学**，而 F1 出在**"求解结果 → DOM 应用"**环节。**纯数学验证必要但不充分；浏览器内的几何 harness 不可替代。** 这是本轮最重要的一条教训。
+
+### 修复（只改 app 2 个文件）
+
+- F1：`.region[hidden], .split[hidden], .splitter[hidden] { display: none; }`（**(0,2,0) > (0,1,0)**），修复处带 15 行根因注释。
+- F2：`measureState()` 重构——**能自己量的量自己**（新增 `h-scroll`：`#app` 自身横向溢出，**永远检查**）；仅两条允许跳过且必带原因（`page-h-scroll`：模拟宽+20 超过真实视口宽时跳过，理由写明"整页必然滚动，本视口下无法判定"，**放得进真实视口时仍报真失败**；`control-covered`：控件 rect 在真实视口外时跳过该控件）。报告新增 `viewport` 与 `skippedChecks[{rule,count,sampleReason}]`。
+- harness 新增精确判据 **`track-item-mismatch`**：容器的「轨道数 == 可见 grid item 数（`getComputedStyle(c).display !== "none"` 实测）」——这正是本次错位缺陷的机器判据。
+
+### 闸门 45 → 55 条断言（captain 复核要点）
+
+- **真算特异性**：`css_specificity()` + `hidden_display_none_rule()`，要求存在一条盖得住 `.region` 的 `[hidden]`+`display:none` 规则；且**先剥离 CSS 注释**再找（captain 自己的朴素正则曾被注释里的 `[hidden]` 骗到，实现者没有）。
+- **双向反作弊**：把每段 `skipped.push(` 抓出来，7 条核心规则（overlap / below-min / box-grown / not-clipped / paint-out / track-item-mismatch / h-scroll）**既不许消失、也不许出现在跳过块里**。
+- **可复跑的变红证据**：`python target\tmp\gate-red-check-t27.py` → `pre_fix_gate_red=True post_fix_gate_green=True pre_fix_mismatch_fires=True post_fix_mismatch_passes=True verdict=PASS`；错位判据 **7vs8（旧，报错）→ 7vs7（新，通过）**。
+
+### captain 独立验收
+
+- 复跑：app 31 / core 89 / cli 34；求解器 28 项；clippy、fmt、build、check 全 0。
+- **用自己的解析独立核算特异性**：(0,2,0) > (0,1,0)，修复在层叠上真的生效。
+- **找到一处残余窄缺口**：`pair-isolation`/`guard-failed`/`reopen-failed` 三条交互规则只被要求"存在"、**未被禁止跳过** ⇒ 把失败改标为"跳过"可蒙过闸门。已决定并入 H2 契约关掉。
+- **澄清一处非缺口**：`h-scroll`（永远检查）与 `page-h-scroll`（可跳过）是两个名字，`contains("\"h-scroll\"")` 不会误匹配 `"page-h-scroll"`（前导引号挡住子串）。
+
+### 待用户
+
+在真实浏览器重跑 `?selftest=1`（或 app 内「跑布局自检」）：确认 ① 区域不再塌缩（`track-item-mismatch`/`below-min` 转绿）；② 跳过清单只跳那两条、且报告里能看到真实视口尺寸。
+
+---
+
+## 2026-10-16 · 第 20 轮：H1b 区域交互验收通过（开关/重开/拖拽/双击/持久化）
+
+`t24` 一次 attempt 完成，`t26` 由 captain 裁决 **pass**。**一键验收脚本首次端到端 20 项全绿**。
+
+### 交付内容（只改 app 4 个文件）
+
+- **每区开关键 + 全局重开入口**：关闭按钮由 `def.closable` 驱动；参数区「区域」块列出四区（常驻区禁用并说明原因）⇒ **关掉的一定回得来**。**最后一个可见区域关不掉**：关闭前过纯函数 `canHide()`，拒绝时把原因写进事件区（不静默失败）。
+- **分隔条拖拽**：分隔条是**占真实 Grid 轨道的元素**（`rebuildSplitters` 按可见孩子数生成 n-1 条，轨道交错为「孩子,间隙,孩子…」且 `gap:0`）⇒ **仍零绝对定位**。数学全在纯函数 `resizePair()`：等量反向、双侧最小值 clamp、到极限停住并回报 `clamped`；页面只把真实 pointer/mouse 位移交给它。
+- **双击分隔条** → 清该容器的钉住尺寸；另有「恢复默认布局」按钮。
+- **每次交互后持久化** `{visible, ratios, sizes}`，坏数据全部回退。
+- **harness 升级为真事件驱动**：36 布局状态 + **14 个交互动作**（拖到正负极限、逐区关闭再重开、尝试关常驻区、双击复位），全部走真实事件处理函数，复用 t23 的 5 条不变量并新增 `pair-isolation` / `reopen-failed` / `guard-failed`。
+- **闸门 28 → 45 条断言**（t23 的 28 条全部保留）。
+
+### captain 独立验收
+
+- **一键验收脚本端到端**：**20 passed / 0 failed**（含新增 B7 求解器测试）。
+- 求解器 `node ui/layout.test.js`：**28 项通过**（t23 的 18 项 + 新增 10 项）。
+- **自写交互数学扫描**（`target\tmp\captain-interaction-sweep.js`）：7 尺寸 × **全 16 种可见性组合** × 每个可见分隔条 = **224 对** ×（±极限 + 小位移）+ **40 步随机连续拖拽链** + **64 次关闭守卫** ⇒ **4180 条断言 / 0 失败**。
+- 读原文复核闸门扩张：新增 17 条覆盖**真实行为**（区域表驱动、`canHide` 守卫与原因展示、n-1 分隔条与 dataset 身份、必须调 `L.resizePair(`、真实事件监听、结束即持久化、双击复位、harness 交互计划与 `pair-isolation`），不是凑数。
+
+### 值得记下的设计优点
+
+1. **几何与事件分离**：拖拽数学在纯函数里 ⇒ 「交互对不对」中属于逻辑的部分**变成可机验的**（captain 正是靠这点独立复验了 4180 条断言）。
+2. **关闭守卫也放纯函数**（`canHide`），而不是埋进 DOM 事件处理，使"最后一个区域不许关"可被精确覆盖。
+3. `pair-isolation` 含「**其它容器轨道一字不变**」，比只查本对更强，能抓跨容器串扰。
+
+### 流程
+
+- 抢单又发生一次（成员空闲 → 评审任务被抢），captain 照例收回。**规律不变：不预先占住成员必被抢。**
+- **上一轮的"瞬时假 FAIL"已复核澄清**：本轮工作区静默时 B6 稳定 31 passed / 0 failed，证实上轮那次 `30 passed / 1 failed` 是**共享工作区并发读写**造成，不是回归。「最终验收必须在工作区静默时跑」这条规矩已写入验收文档警示。
+
+### 明确移交
+
+**像素级与真实交互结论无人验证过**（沙箱内 WebView2 与 headless Edge 均被拦），转为 **G15**（harness，50 个状态）与 **G16**（手动拖拽到极限 / 关区再重开 / 双击复位 / 刷新后布局保持）。
+
+### 下一步
+
+**H2：功能区侧边栏**（串口/SSH/Git 三入口跳转；SSH/Git 视图留空占位）。**关键约束**：切换功能区**不得中断串口会话、不得丢失已接收的显示内容**——显示缓冲要归 JS 状态而不是 DOM（这条是 captain 在评审用户方向时补的）。
+
+---
+
+## 2026-10-16 · 第 19 轮：H1a 布局内核验收通过（根治"界面混在一起"）
+
+### 用户给的方向 + captain 的三处修正
+
+用户要求**从根本上解决 GUI 显示混乱**，并给了 6 点方向。captain 逐条评审后修正三处：
+
+1. **用户的第 2 点（"渲染整个界面，由窗口决定显示什么"）是 bug 成因之一**——必须补上「**区域盒子尺寸永不随内容变化**、内容放不下由区域自己裁剪」，否则必然重叠。
+2. **第 6 点漏了"关闭该行/列最后一个区域"的情形**——补：父节点只剩一个孩子则**塌缩**，空间由兄弟吸收。
+3. **第 7 点要补**：拉伸必须**同时 respect 两侧最小值**、到极限停住；且**窗口小于最小值总和时区域不再缩、由整页滚动兜底**（用户确认了这一点）。
+
+另加两条用户没提但必需的：**区域关掉后必须有全局入口重开**（按钮长在区域身上，关了就没），以及**布局求解器必须是纯函数 + 零依赖 Node 测试**（让 captain 能独立验一半）。
+
+### t23（H1a）的交付与波折
+
+**第一次 attempt 因基础设施传输故障（TRANSPORT）中断**，非质量问题。captain 先评估现场：**工作区全程未损坏**（app 31 passed、build exit 0），且产出已接近完成 ⇒ **决定重试收尾而非推倒重来**。
+
+**失败的真实原因值得记录**：成员在完成合同工作后**自行越过契约边界**——给 `window`/`location` 打桩、想在 Node 里跑 DOM 做"depth-aware hit test"，最终卡在补桩上耗尽回合。契约本已划界（**Node 只覆盖纯求解器；DOM 几何验证归浏览器内 harness**）。captain 在重试指令中明确该边界并说明「打桩测 DOM 只能测到桩自己」，成员随即停止该路线，`target\tmp` 下 `h1a-script*`/`patch-smoke`/`dom-smoke-t23*` 已清理。
+
+### 交付内容（只改 app 4 个文件）
+
+- `ui/layout.js` —— **纯函数求解器**：唯一区域表（params/tx/rx/events，各含 minW/minH/weight/closable/defaultVisible）+ 分割树 + `solve()`（每层先扣最小值、剩余按权重分；永不低于最小值；只剩一个孩子则塌缩）+ `normalizeState/serializeState`。返回 `{rects, tracks, collapsed, minSize, overflow}`。**不碰 DOM**，Node 与浏览器共用一份。
+- `ui/layout.test.js` —— 零依赖 Node 测试 18 项。
+- `ui/index.html` —— 布局根改 `#app`（Grid，轨道由求解结果写 px）；区域容器由注册表创建、内容经 `regions.get(id)` 写；`.region` 强制 `overflow: hidden` + `min-*: 0`；localStorage 持久化；**页内 harness**（`?selftest=1`，9 尺寸 × 4 可见性组合 = 36 状态 × 5 条不变量，PASS/FAIL + 可复制 JSON，先存后还只测量）。
+- `src/main.rs` —— t17 的布局闸门**同名重写**。
+
+### captain 独立验收
+
+- 复跑：app 31 / core 89 / cli 34；clippy、fmt、check --workspace、build 全 0；**用捆绑 Node 亲自跑 `layout.test.js` → 18 项通过 / 0 失败**。
+- **自写 192 状态独立扫描**（`target\tmp\captain-sweep.js`）：12 尺寸 × **全 16 种可见性组合**，断言两两不相交 / 不低于最小值 / 不越界 ⇒ **0 失败**。这把 harness 要检查的**数学部分**提前验证了。
+- **重点复核"闸门有没有被削弱"**（改测试最危险处）：读原文对比后判定 **更强**——旧版是"选择器里有没有某串声明"的文本匹配（换写法即绕过），新版 28 条断言钉**结构根因**（四区 `minW/minH` 数值必须 > 0、禁止绝对定位、禁止复制求解器或区域表、harness 五条不变量与"先存还"必须在、区域表 ↔ DOM 内容源 1:1）。
+
+### 本轮 captain 自己的两个失误（都记下来）
+
+1. **我违反了自己定的规则**：`scripts/accept.ps1` 必须**纯 ASCII**（PS 5.1 会把无 BOM 的 `.ps1` 按 ANSI 解码），而我在新增 B7 时写了 `'通过 \d+ 项'`。那 9 个字节被按 ANSI 解出乱码后**破坏了字符串终止**，导致**整个文件**（185–192 行）连环解析错。**失败模式是"一处违规污染全文件"**，不是局部报错。已改为用 `[char]` 码构造该词，并核回"非 ASCII 字节数 = 0 / 解析错误数 = 0"。
+2. **我在成员施工中途跑了验收套件，得到瞬时假 FAIL**（B6 同一秒报 30 passed / 1 failed，几秒后重跑 31 passed）——当时成员正在写 `layout.js`/`layout.test.js`。**工作区是共享的，最终验收必须在静默时跑**；我已把这条写进 `docs/ACCEPTANCE.md` 的警示，并采取"出现 FAIL 先重跑确认"的做法。
+
+### 明确移交
+
+**像素级结论（真实排版、真实遮挡）无人验证过**，转为用户验收项 **G15**，给出确切 harness 命令（file:// + `%20`，或 app 内「跑布局自检」按钮）。沙箱内无法验证的原因已有原文证据（Chromium mojo 需命名管道被拒）。
+
+### 验收工具
+
+`scripts/accept.ps1` 新增 **B7**（`node ui/layout.test.js`，找不到 node 时回退 DSH 捆绑运行时），并把 B1/B2 的期望数更新为 89/34。沙箱内实跑（成员施工间隙）：19 passed / 1 failed（那 1 个即上述瞬时假 FAIL）。
+
+---
+
+## 2026-10-16 · 第 18 轮：增量 G2（GUI 指纹采集 + 日志列表）验收通过
+
+`t20` 一次 attempt 完成，captain 建 `t22` 评审并裁决 **pass**（范围限定为适配层 + 数据链 + 闸门；界面交互移交用户）。
+
+### 交付（只改 `crates/embhub-app` 2 个文件）
+
+- `open_session` 配置对象新增 `repoPath`/`binPath`；填了就调 core `fingerprint::collect` 采集并走既有 v2 头写入。**打开后回读磁盘会话头再交给界面**（不是显示"打算写入的值"）；回读失败退回写入值并附 `fingerprint_note` 显式告警。
+- 界面：参数区 `#fpHint` 逐字提示「本会话日志将不包含固件指纹」；`#fpStatus` 显示 40 位 commit/dirty/bin_hash（缺失字段打印 core 的 `Field::Missing` 原文）；**浮层**日志列表（`position: fixed`，不参与 flex 分配 → 不会重现 t17 的挤压），每项可复制 commit / 日志路径。
+- 新增只读命令 `list_sessions(root)`（默认数据目录/sessions）。
+
+### 实测
+
+core **89** / cli **34** / app **31**（t17 的 17 条逐名全在，新增 14 条）；clippy / fmt / `check --workspace --all-targets` 全 exit 0；Cargo.lock 未变；core/cli 一行未改（mtime 15:24 vs app 15:34）。
+
+### 本轮最有价值的演进：captain 的手工校验被升级为永久闸门
+
+captain 前几轮用**手写正则**做的「命令集前后端对称」「元素 id 全部有定义」检查，本任务被做成了随 `cargo test` 永跑的 Rust 测试：
+
+- `ui_command_set_is_symmetric_with_the_backend` / `ui_referenced_element_ids_are_all_defined`
+- **`app_never_mutates_the_repository`** —— 把 main.rs 按 `#[cfg(test)]` 切出生产段，**先自检切片含 `fn main`/`fn open_session` 且不含 `#[test]`**（防空切片空过），再断言不含 `checkout`/`switch`/`reset`/`--hard`/`stash` 等。**用户「不碰我仓库」的要求由此永久机器化。**
+- `fingerprint_json_keys_stay_exactly_as_the_on_disk_header` —— 钉死 JSON 键名不得改磁盘格式（captain 的裁定落地）。
+- `source_config_separates_baud_from_frame` —— 缺分隔符缺陷的防复发，且用**非默认参数** `8E1 RTS/CTS` 做**精确等式**断言。
+- `ui_states_that_a_session_without_repo_has_no_fingerprint` —— 强制诚实要求机器化。
+
+**captain 读了两条最关键闸门的源码原文**（`app_never_mutates_the_repository`、`gui_path_end_to_end_fingerprint_reaches_the_session_list`），确认真断言、非空过、非子串穷举。
+
+### captain 的裁定落地情况
+
+- 「不造第二套 JSON 形状」→ 已闸门化；
+- 「`skipped` 条目要可见」→ 已从"跳过 N 个"改为逐条 `name：reason`；
+- 来源配置分隔符缺陷（t19 发现、captain 解磁盘头确证）→ 已修 + 防复发断言。
+
+### 明确移交
+
+「参数区提示无指纹」「打开后显示 40 位 commit/dirty/bin_hash」「日志列表可列历史会话并复制 commit」**无人点过**（沙箱内 WebView2 建窗被拦），转为用户验收项 **G12–G14**。
+
+**另给出一条可脱离肉眼验证的手段**：用新构建开一个带 repo 的会话后跑 `sessions --root <数据目录>\sessions`，新会话行应显示**带空格的** `serial:COMxx@115200 8N1 无流控` 且指纹不再是「未采集」——**把界面上的两处关键改动变成可机读的证据**。
+
+### 流程
+
+抢单又发生一次（t20 完成后 coder-ds 空闲 → t22 被抢）。**规律已确认**：不预先占住成员，共享池任务必被抢。下一轮起改为「先建下一个实现任务，再建评审任务」。
+
+---
+
+## 2026-10-16 · 第 17 轮：增量 G1（会话列举 + `sessions` 子命令）验收通过
+
+用户选定下一功能：**先做固件指纹 + 日志列表**（暂不做 Git 状态条），并明确**不做 checkout**（只显示/复制 commit，不碰用户仓库）。据此拆成 `t19`（core+CLI）与 `t20`（GUI，依赖 t19）。
+
+`t19` 交付 core `list_sessions(root) -> SessionList` + CLI `sessions --root <dir> [--json]`，captain 建 `t21` 评审并裁决 **pass**。
+
+### 交付与实测
+
+- core **89 passed**（76→89，+13）、cli **34 passed**（27→34，+7）；clippy / fmt 干净；零新增 crate（JSON 用 cli 早已依赖的 serde_json）。
+- **设计要点**：`list_sessions` 是**总函数（返回类型里没有 `Err`）**——根目录问题进 `rootProblem`、单会话问题进各自 `problem`、非目录条目进 `skipped`（带原因）。列举不会因数据损坏整体失败，**错误原因随数据返回而非被吞**。payload 字节数按记录头 seek 扫描（不读 payload、不校验 CRC），列目录不怕大日志，且**坏会话仍能报出字节数**。CLI 除参数错外退码恒为 0；UTC 换算自实现（civil_from_days），零依赖。
+
+### captain 独立验收（四项，均未采信自述）
+
+1. **真实数据端到端**：在用户 GUI 产生的会话目录上实跑，四个会话的 payload 1239/985/2392/1218 字节、记录 78/73/155/75 条，与 captain 先前**纯 PowerShell 独立解析器**手算的 1239/78 **完全一致**。
+2. **自造对抗目录**（1 好 + 5 坏 + 1 游离文件）：**核心不变量「一个坏会话绝不丢好会话」成立**——好会话完好列出；坏会话各自给出具体原因（`magic 不匹配` / `缺少 header.bin` / `header.bin 太短: 10 < 24` / v1 废弃**带升级指引** / 非会话目录）；游离文件进 `skipped`；**exit 0、无 panic**。
+3. **独立核对自实现 UTC 换算**：用 `FromUnixTimeMilliseconds` 复算，与 CLI 输出**逐字符相同**。自实现日历换算最易错，交叉核对必要。
+4. **JSON 用 PowerShell 独立解析**（未采信实现者的 Python 断言）：键位与描述一致；根目录不存在 → exit 0 + `rootProblem`；缺 `--root` → exit 1。
+
+### 成员顺手发现并上报的 app 缺陷（captain 已确证）
+
+`crates/embhub-app/src/main.rs:545` 的 `format!("serial:{port}@{}{}", baud, frame.summary())` **缺分隔符** → t14 之后的会话落盘为 `serial:COM14@1152008N1 无流控`。captain **直接解磁盘头原始字节**证实：t10 期的 `s1792129848436-0000` 是干净的 `serial:COM13@115200`，之后三个会话都粘连。
+
+**成员没有越界改 app，而是如实上报**——处理正确。已通过 `agent_teams_amend_task` 把一行修复并入 `t20` 契约（在其 inScope 内），并要求加一条「来源配置含分隔符」的防复发断言。
+
+> 这条缺陷本身很小，但**它证明了 `sessions` 这个能力的价值**：一个从 GUI 产生的、肉眼在界面上看不出问题的日志头，被列举功能如实暴露了出来。
+
+### captain 对成员提问的裁定：不造第二套 JSON 形状
+
+`fingerprint` 子对象沿用磁盘键 `collected`/`not_collected` 是对的——那是**同一个 Rust 类型**，同时用于写 v2 磁盘头；加 `serde(rename)` 会改变落盘键名、破坏既有日志格式契约。前端按实际键名消费即可。
+
+### 用户现在就能自己验（不需要板子）
+
+```powershell
+.\scripts\cargo.cmd run --quiet -p embhub-cli -- sessions --root target\debug\embhub-data\sessions
+```
+
+---
+
 ## 2026-10-16 · 第 16 轮：GUI 挤压缺陷根因修复（t17）验收通过
 
 用户实测报的布局缺陷（接收区内容增长把发送区/事件区挤出可视区、点不到）已由 `t17` 修复并验收（`t18` 由 captain 裁决 pass）。实测：core 76 / cli 27 / **app 17**；clippy / fmt / build 全 0。

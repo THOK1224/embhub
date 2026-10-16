@@ -33,9 +33,10 @@ pub use source::{
     SourceError, StopBits, SyntheticConfig, SyntheticSink, SyntheticSource,
 };
 pub use store::{
-    read_session_header, Chunk, FingerprintSection, LogStore, ReplaySource, SessionHeader,
-    SessionId, SessionMeta, SessionStart, SessionStats, StoreError, FINGERPRINT_NOT_COLLECTED,
-    FORMAT_VERSION, HEADER_MAGIC, RECORD_HEADER_LEN, V1_FINGERPRINT_PLACEHOLDER_LEN,
+    list_sessions, read_session_header, Chunk, FingerprintSection, LogStore, ReplaySource,
+    SessionHeader, SessionId, SessionList, SessionMeta, SessionStart, SessionStats, SessionSummary,
+    SkippedEntry, StoreError, FINGERPRINT_NOT_COLLECTED, FORMAT_VERSION, HEADER_MAGIC,
+    RECORD_HEADER_LEN, V1_FINGERPRINT_PLACEHOLDER_LEN,
 };
 
 use serde::Serialize;

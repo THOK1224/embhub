@@ -55,14 +55,14 @@ Write-Host "[B] build, tests, static checks" -ForegroundColor Yellow
 $r = Invoke-Cargo @('test','-p','embhub-core')
 $m = [regex]::Match($r.Text, '(\d+) passed; (\d+) failed')
 $seen = if ($m.Success) { $m.Value } else { 'no "N passed" line' }
-Report 'B1' 'cargo test -p embhub-core  (expect 76 passed / 0 failed)' `
+Report 'B1' 'cargo test -p embhub-core  (expect 89 passed / 0 failed)' `
        ($r.Code -eq 0 -and $m.Success -and [int]$m.Groups[2].Value -eq 0) `
        ("exit={0}  {1}" -f $r.Code, $seen)
 
 $r = Invoke-Cargo @('test','-p','embhub-cli')
 $m = [regex]::Match($r.Text, '(\d+) passed; (\d+) failed')
 $seen = if ($m.Success) { $m.Value } else { 'no "N passed" line' }
-Report 'B2' 'cargo test -p embhub-cli   (expect 27 passed / 0 failed)' `
+Report 'B2' 'cargo test -p embhub-cli   (expect 34 passed / 0 failed)' `
        ($r.Code -eq 0 -and $m.Success -and [int]$m.Groups[2].Value -eq 0) `
        ("exit={0}  {1}" -f $r.Code, $seen)
 
@@ -78,9 +78,30 @@ Report 'B5' 'cargo build -p embhub-app   (GUI must stay buildable)' ($r.Code -eq
 $r = Invoke-Cargo @('test','-p','embhub-app')
 $m = [regex]::Match($r.Text, '(\d+) passed; (\d+) failed')
 $seen = if ($m.Success) { $m.Value } else { 'no "N passed" line' }
-Report 'B6' 'cargo test -p embhub-app    (expect 17 passed / 0 failed)' `
+Report 'B6' 'cargo test -p embhub-app    (expect 31 passed / 0 failed)' `
        ($r.Code -eq 0 -and $m.Success -and [int]$m.Groups[2].Value -eq 0) `
        ("exit={0}  {1}" -f $r.Code, $seen)
+
+# B7: the layout solver is pure JS, so its tests run under plain Node (no browser).
+$nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
+if (-not $nodeExe) {
+  $cand = Join-Path $env:USERPROFILE '.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
+  if (Test-Path $cand) { $nodeExe = $cand }
+}
+if (-not $nodeExe) {
+  Report 'B7' 'node ui/layout.test.js      (layout solver tests)' $false 'node not found on PATH nor in the DSH bundled runtime'
+} else {
+  $out = & $nodeExe (Join-Path $Root 'crates\embhub-app\ui\layout.test.js') 2>&1
+  $code = $LASTEXITCODE
+  # NOTE: keep this file ASCII-only. PS 5.1 reads a BOM-less .ps1 as ANSI, so one
+  # non-ASCII literal breaks string termination and corrupts the WHOLE file's parse.
+  # The Chinese summary word is therefore built from char codes, not typed literally.
+  $passWord = [string][char]0x901A + [string][char]0x8FC7
+  $sum = ($out | Select-String -Pattern ($passWord + ' \d+ ') | Select-Object -First 1).Line
+  if (-not $sum) { $sum = ($out | Select-Object -Last 1) }
+  Report 'B7' 'node ui/layout.test.js      (layout solver: pure, no browser)' `
+         ($code -eq 0) ("exit={0}  {1}" -f $code, $sum)
+}
 
 # ---------------------------------------------------------------- A: zero-loss loops
 Write-Host ""
