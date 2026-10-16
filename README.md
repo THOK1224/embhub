@@ -3,14 +3,16 @@
 面向嵌入式开发的桌面集成工具：把**串口调试**、**SSH/SFTP**、**Git** 放进同一条工作流，
 并把每份日志与**当时运行的固件指纹**（commit + dirty + bin hash）绑定起来。
 
-> **当前状态：Phase 0 已通过；Phase 1 增量 A、B1、B2、C1 已验收。**
+> **当前状态：Phase 0 已通过；Phase 1 增量 A、B1、B2、C1、C2a、C2b、F1、F2 已验收。当前目标：串口助手基本功能。**
 > ✅ **Phase 0 全部通过**：Rust 工具链、MSVC 链接、Tauri v2 编译、WebView2 就位、窗口正常打开、**插拔串口后列表能刷新**、**115200 下能收到板子发来的真实数据**。
 > ✅ 增量 A：`ByteSource` + `LogStore` + `cli selftest`（零丢失闭环）。证据见 [`LOG.md`](LOG.md) 第 5 轮。
 > ✅ 增量 B1：`fingerprint` 固件指纹采集 + 自实现 SHA-256（bin_hash 与 Windows `Get-FileHash` 交叉校验一致）。证据见 [`LOG.md`](LOG.md) 第 7 轮。
 > ✅ 增量 B2：指纹写进会话头，**日志格式升到 v2**，`selftest --repo` 端到端从磁盘读回比对；captain 另做了不经 Rust 的字节级校验（头长 558 = 24+486+4+44）。证据见 [`LOG.md`](LOG.md) 第 8 轮。
 > ✅ 增量 C1：**流式管线与背压**（SPEC 4.3）。captain 用两项独立验证确认「显示可丢、落盘不可丢」：把显示队列容量设为 **0**（显示 100% 丢弃）时落盘仍零丢失；并用**纯 PowerShell 直接解析磁盘分片**数出 payload 536,870,912 == 源产出，**差 = 0**。证据见 [`LOG.md`](LOG.md) 第 9 轮。
-> ⬜ 下一步：增量 C2（把 GUI 接到这条管线上）。
-> 全项目测试基线：**core 50 passed + cli 17 passed**；`clippy -D warnings` 与 `fmt --check` 干净。
+> ✅ 增量 C2a：**发送能力 `ByteSink` + `Session` 最小实现 + `cli send`/`loopback`**。`loopback --bytes 1000000` 证明「写入 == 读回 == 落盘 == 回放」。证据见 [`LOG.md`](LOG.md) 第 10 轮。
+> ✅ 增量 C2b：**GUI 串口助手面板**（打开/关闭会话、接收区文本↔HEX、发送区文本/HEX + 追加 CR/LF/CRLF、RX/TX/显示丢弃 计数）。captain 验到「能编译 + 命令/事件/元素 id 接线对称 + 适配层 8 个单测」，**交互部分无人点过**（沙箱内 WebView2 起不来），已移交为 G1–G7 用户验收项。证据见 [`LOG.md`](LOG.md) 第 11 轮。
+> ⚠️ **待你验**：`.\scripts\accept.ps1` 跑自动项（19 条）＋ [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) 第 3 节的 **G1–G10**（含**真机发送**、**串口参数真机生效**、**定时发送停止后不再发**）。
+> 全项目测试基线：**core 76 + cli 27 + app 17 = 120 passed**；`clippy -D warnings` 与 `fmt --check` 干净。
 
 ---
 
@@ -113,6 +115,48 @@ cargo run -p embhub-app                      # 启动 spike 窗口
   取不到的字段用 `Field<T> { Value(T), Missing(String) }` 表示——**「看着有指纹、其实是空的」在类型上不成立**。
 - `embhub-core::sha256` —— 自实现的流式 SHA-256（纯 std，**零新增第三方依赖**），与 Windows `Get-FileHash` 在真实文件上逐字符一致。
 - `embhub-cli fingerprint --repo <dir> [--bin <file>]` —— 打印全部字段，缺失字段打印原因并汇总清单；采集失败仍以 0 退出（**不是命令失败**），仅缺 `--repo` 时以 1 退出。
+
+**Phase 1 增量 F1/F2：串口参数、时间戳、定时发送（已验收，交互待你验）**
+
+- **串口参数完整化**（t13）：`DataBits`(5/6/7/8)、`Parity`(None/Odd/Even)、`StopBits`(1/2)、`FlowControl`(None/RTS-CTS/XON-XOFF) 四个枚举 + `SerialFrame`，由**唯一落点** `build_serial_builder` 真正链到 serialport builder（读写两条路径共用）。非法组合（5 数据位+2 停止位等）给**点名冲突**的错误，**绝不静默降级**。
+  - 已知边界：`serialport 4.x` **没有 1.5 停止位**，故 `StopBits::OneAndHalf` 会返回明确错误，界面**不提供**该选项（代码里有注释说明原因）。
+- **精确墙上时钟对应**（t13）：`SessionStart { wall_ms, mono_micros }` 在会话创建点背靠背取样 → `SessionSnapshot::wall_time_ms_for(t_mono)` 精确换算。**不用"第一批到达时间"近似**（有确定性测试：断言起始点落在 `start()` 前后两次取样的区间内）。
+- **GUI 参数控件 / 时间戳开关 / 定时发送**（t14）：`open_session` 改收配置对象；四个参数选择器**运行时禁用**并在状态行显示实际生效的帧格式；接收区 `[HH:MM:SS.mmm]` 时间戳开关（切换无损）；定时发送（间隔 + 起停，**复用与手动发送同一个帧构造**，关会话自动停且有第二道闸）。
+
+  ```
+  # 无硬件验证串口参数与时钟的底层映射（真机生效需用板子验，见 G8）
+  .\scripts\cargo.cmd test -p embhub-core        # 76 passed，含 data_bits/parity/stop_bits/flow_control 映射
+  ```
+
+> ⚠️ **这四项参数是否真的改变硬件通信行为，尚未真机验证**（本机无第二串口对端，且不向未知设备写入）。请用 G8 验证。
+
+**Phase 1 增量 C2b：GUI 串口助手面板（已验收，交互部分待你验）**
+
+- 4 个 Tauri 命令：`open_session(port, baud)` / `close_session()` / `session_stats()` / `send_data(data, mode, append)`；命令与显示批次事件的**接口契约固定**，适配层全部留在 `crates/embhub-app`（core 不依赖 tauri）。
+- 事件 `session-batch`，载荷 `{ seq, t_mono, hex }`（`seq` 从 1 严格递增，`hex` 大写无分隔符）；泵在采集线程结束后会**排空尾部批次**再退出（否则最后几批会"已落盘却没上屏"）。
+- 界面：刷新端口 / 选端口与波特率 / 打开·关闭（按钮状态随会话变）/ 接收区 **文本↔HEX** / 清空 / 自动滚动 / 发送区 **文本·HEX** + 追加 `none·CR·LF·CRLF` / **RX·TX·显示丢弃** 三计数 / 错误面板。原生 HTML/JS，**零构建依赖**。
+- 显示区只保留最近 **256 KiB**（仅影响上屏；落盘与计数不受影响，界面有明示）。
+- 失败可见：无端口 / 不在端口列表 / 可能被占用 都给出**可行动原因**，不是笼统"失败"。
+
+> **这段的交互没人点过**：DSH 沙箱内 WebView2 起不来，captain 只验到"能编译 + 接线名字全对 + 适配层 8 个单测"。打开窗口、接收、发送请按 [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) 第 3 节的 **G1–G7** 走一遍。
+
+**Phase 1 增量 C2a：发送能力与 Session（已验收）**
+
+- `embhub-core::source::ByteSink` —— **发送侧接口**（`write_all` / `flush`），刻意与只读的 `ByteSource` 分开：发送不是"反过来读"，读句柄与写句柄可以是两个独立对象（`try_clone()`），失败模式也不同。
+- `SerialSource::try_clone_sink()` —— 用 serialport `try_clone()` 给出**共享同一物理端口**的写句柄。
+- `SyntheticSource::loopback()` —— **回环**源：写进去的字节被同一个源读回，使"能发"这件事**无需硬件即可端到端验证**。
+- `embhub-core::session` —— SPEC 3.4 最小实现：`start` / `stop`（幂等）/ `stats`（含 tx 计数，停后仍可读）/ `recv_batch` / `send`。
+- `embhub-cli loopback --bytes N` —— 证明「写入 == 读回 == 落盘 == 回放」四方一致且逐字节相同。
+- `embhub-cli send --port <p> --data <hex:…|text:…> [--append none|cr|lf|crlf] [--repeat N]` —— 参数非法一律先报错再动手（拒绝静默发送空数据）。
+
+  ```
+  .\scripts\cargo.cmd run --quiet -p embhub-cli -- loopback --bytes 1000000
+  → written == read_back == logged == replay == reference == 1000000   逐字节一致
+
+  .\scripts\cargo.cmd run --quiet -p embhub-cli -- send --port COM13 --data hex:AA5501FF --append none
+  ```
+
+> ⚠️ **真机发送尚未验证**：实现者正确拒绝向本机未知串口设备（COM3–COM12 多为蓝牙虚拟口）写入——那可能有真实副作用。真机发送请在 GUI 里用你的板子验证。
 
 **Phase 1 增量 C1：流式管线与背压（已验收）**
 

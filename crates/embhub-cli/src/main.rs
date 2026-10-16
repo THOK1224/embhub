@@ -6,6 +6,8 @@
 //!   embhub-cli selftest [--bytes 67108864] [--seed 42] [--repo <dir> [--bin <file>]]
 //!   embhub-cli fingerprint --repo <dir> [--bin <file>]
 //!   embhub-cli stream --bytes N [--chunk K] [--consume fast|slow|stalled] [--display-capacity C]
+//!   embhub-cli loopback --bytes N [--chunk K] [--display-capacity C]
+//!   embhub-cli send --port <p> --data <hex:AA55FF|text:hello> [--append none|cr|lf|crlf] [--repeat N]
 //!
 //! `selftest` 是 Phase 1「零丢失」闭环的无硬件自证：合成源注入 → LogStore 落盘
 //! → `open_replay` 读回，打印「注入 / 落盘 / 回放读回」三个计数并逐字节比对；
@@ -19,6 +21,10 @@
 //! `stream` 走 PLAN 4.3 的流式管线（常驻读取 + 批量推送 + 有界显示队列背压）：
 //! **退出码只取决于落盘零丢失**（`logged_bytes == N` 且回放读回也是 N），
 //! 显示被丢掉多少都不影响退出码——这正是「显示可以丢、落盘一个字节都不能丢」。
+//!
+//! `loopback` 是无硬件证明「**能发**」的闭环：合成源回环（写进去的字节被同一个源读回）
+//! → 会话（源 + 管线 + 落盘）→ 断言「写入 == 读回 == 落盘 == 回放」四方一致。
+//! `send` 则是对真实串口的发送命令（`ByteSink`；参数非法时明确报错并非零退出）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,10 +36,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use embhub_core::fingerprint::{self, Field};
 use embhub_core::{
-    ByteSource, Chunk, DisplayBatch, FingerprintSection, FirmwareFingerprint, LogStore, Pipeline,
-    PipelineConfig, SessionId, SessionMeta, SourceError, StopReason, SyntheticConfig,
-    SyntheticSource, DEFAULT_BATCH_BYTES, DEFAULT_BATCH_TIMEOUT_MS, DEFAULT_DISPLAY_CAPACITY,
-    RECORD_HEADER_LEN,
+    ByteSink, ByteSource, Chunk, DisplayBatch, FingerprintSection, FirmwareFingerprint, LogStore,
+    Pipeline, PipelineConfig, SerialConfig, SerialSink, Session, SessionId, SessionMeta,
+    SourceError, StopReason, SyntheticConfig, SyntheticSource, DEFAULT_BATCH_BYTES,
+    DEFAULT_BATCH_TIMEOUT_MS, DEFAULT_DISPLAY_CAPACITY, RECORD_HEADER_LEN,
 };
 
 /// `selftest` 默认注入量：64 MiB（SPEC 3.3 的默认分片大小）。
@@ -59,8 +65,12 @@ fn main() -> ExitCode {
         "selftest" => cmd_selftest(&args),
         "fingerprint" => cmd_fingerprint(&args),
         "stream" => cmd_stream(&args),
+        "loopback" => cmd_loopback(&args),
+        "send" => cmd_send(&args),
         other => {
-            eprintln!("未知子命令: {other}（可用: list | read | selftest | fingerprint | stream）");
+            eprintln!(
+                "未知子命令: {other}（可用: list | read | selftest | fingerprint | stream | loopback | send）"
+            );
             ExitCode::FAILURE
         }
     }
@@ -398,6 +408,433 @@ fn cmd_stream(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("stream 失败: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 行尾终结符（`--append`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppendEnd {
+    None,
+    Cr,
+    Lf,
+    Crlf,
+}
+
+impl AppendEnd {
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "none" => Some(AppendEnd::None),
+            "cr" => Some(AppendEnd::Cr),
+            "lf" => Some(AppendEnd::Lf),
+            "crlf" => Some(AppendEnd::Crlf),
+            _ => None,
+        }
+    }
+
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            AppendEnd::None => b"",
+            AppendEnd::Cr => b"\r",
+            AppendEnd::Lf => b"\n",
+            AppendEnd::Crlf => b"\r\n",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AppendEnd::None => "none",
+            AppendEnd::Cr => "cr",
+            AppendEnd::Lf => "lf",
+            AppendEnd::Crlf => "crlf",
+        }
+    }
+}
+
+/// 解析 `--data`：`hex:AA55FF` 或 `text:hello`。**空数据一律拒绝**（不允许静默发送空帧）。
+fn parse_send_payload(data: &str) -> Result<Vec<u8>, String> {
+    if let Some(hex) = data.strip_prefix("hex:") {
+        let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        if clean.is_empty() {
+            return Err("--data hex: 之后没有字节（拒绝发送空数据）".to_string());
+        }
+        if !clean.len().is_multiple_of(2) {
+            return Err(format!(
+                "hex 必须是偶数个字符（实际 {} 个）: {clean}",
+                clean.len()
+            ));
+        }
+        let bytes = clean.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for i in (0..bytes.len()).step_by(2) {
+            let hi = (bytes[i] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("hex 里有非十六进制字符: {clean}"))?;
+            let lo = (bytes[i + 1] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("hex 里有非十六进制字符: {clean}"))?;
+            out.push((hi * 16 + lo) as u8);
+        }
+        Ok(out)
+    } else if let Some(text) = data.strip_prefix("text:") {
+        if text.is_empty() {
+            return Err("--data text: 之后为空（拒绝发送空数据）".to_string());
+        }
+        Ok(text.as_bytes().to_vec())
+    } else {
+        Err(format!(
+            "--data 必须写成 hex:AA55FF 或 text:hello（实际 {data:?}）"
+        ))
+    }
+}
+
+/// 一帧 = 数据 + 终结符（`--repeat N` 时每一帧都带终结符）。
+fn build_send_frame(payload: &[u8], append: AppendEnd) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + append.bytes().len());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(append.bytes());
+    frame
+}
+
+fn hex_preview(bytes: &[u8], max: usize) -> String {
+    bytes
+        .iter()
+        .take(max)
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `send --port <p> --data <hex:…|text:…> [--append none|cr|lf|crlf] [--repeat N] [--baud B]`
+///
+/// 参数非法（缺 `--port`/`--data`、hex 非法或空、`text:` 为空、`--append` 不认、
+/// `--repeat 0`）一律**先报错再动手**，绝不静默发送空数据。
+fn cmd_send(args: &[String]) -> ExitCode {
+    let usage = "用法: embhub-cli send --port <p> --data <hex:AA55FF|text:hello> \
+                [--append none|cr|lf|crlf] [--repeat N] [--baud 115200]";
+
+    let port = match arg_value(args, "--port") {
+        Some(p) if !p.trim().is_empty() => p,
+        Some(_) => {
+            eprintln!("--port 不得为空\n{usage}");
+            return ExitCode::FAILURE;
+        }
+        None => {
+            eprintln!("缺少 --port\n{usage}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let data = match arg_value(args, "--data") {
+        Some(d) => d,
+        None => {
+            eprintln!("缺少 --data（不允许静默发送空数据）\n{usage}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let payload = match parse_send_payload(&data) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}\n{usage}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let append = match arg_value(args, "--append") {
+        Some(v) => match AppendEnd::parse(&v) {
+            Some(a) => a,
+            None => {
+                eprintln!("--append 只能是 none | cr | lf | crlf（实际 {v}）\n{usage}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => AppendEnd::None,
+    };
+    let repeat: u64 = match arg_value(args, "--repeat") {
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => {
+                eprintln!("--repeat 必须 ≥ 1（0 次发送等于什么都没发）\n{usage}");
+                return ExitCode::FAILURE;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("--repeat 必须是正整数: {v}（{e}）\n{usage}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => 1,
+    };
+    let baud: u32 = arg_value(args, "--baud")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(115_200);
+
+    let frame = build_send_frame(&payload, append);
+    let cfg = SerialConfig {
+        port_name: port.clone(),
+        baud,
+        read_timeout_ms: 200,
+    };
+    let mut sink = match SerialSink::open(&cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("无法打开 {port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("== embhub send（ByteSink）==");
+    println!("端口          : {port} @ {baud}");
+    println!("数据          : {} 字节（{}）", payload.len(), data);
+    println!(
+        "终结符        : {}（{} 字节）",
+        append.label(),
+        append.bytes().len()
+    );
+    println!("重复          : {repeat} 次");
+
+    let written = match write_frame_repeatedly(&mut sink, &frame, repeat) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "单帧字节      : {}（HEX: {}）",
+        frame.len(),
+        hex_preview(&frame, 32)
+    );
+    println!("共发送        : {written} 字节");
+    ExitCode::SUCCESS
+}
+
+/// 把同一帧写 `repeat` 次（每次 `flush`），返回成功写出的总字节数。
+/// 失败时把「第几次 / 此前已发多少字节」写进错误串——发送失败必须能定位到进度。
+fn write_frame_repeatedly(
+    sink: &mut dyn ByteSink,
+    frame: &[u8],
+    repeat: u64,
+) -> Result<u64, String> {
+    let mut written: u64 = 0;
+    for i in 1..=repeat {
+        sink.write_all(frame)
+            .and_then(|()| sink.flush())
+            .map_err(|e| format!("第 {i} 次发送失败（此前已发 {written} 字节）: {e}"))?;
+        written += frame.len() as u64;
+    }
+    Ok(written)
+}
+
+/// `loopback --bytes N [--chunk K] [--display-capacity C]` 的计数快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoopbackSummary {
+    /// 通过 `Session::send` 写出去（进回环）的字节数。
+    written_bytes: u64,
+    /// 管线从回环源读回的字节数。
+    read_back_bytes: u64,
+    /// 落盘字节数。
+    logged_bytes: u64,
+    /// 由 `open_replay` 独立回放读回的字节数。
+    replay_bytes: u64,
+    /// 独立重建的注入序列字节数（逐字节比对的参照）。
+    reference_bytes: u64,
+    /// 首个不一致偏移（`None` = 完全一致）。
+    first_diff: Option<u64>,
+    batches_emitted: u64,
+    batches_received: u64,
+    display_bytes_received: u64,
+    fatal_error: Option<String>,
+}
+
+impl LoopbackSummary {
+    /// 四方一致（写入 == 读回 == 落盘 == 回放）+ 逐字节一致 + 无致命错误。
+    fn consistent(&self, expected: u64) -> bool {
+        self.written_bytes == expected
+            && self.read_back_bytes == expected
+            && self.logged_bytes == expected
+            && self.replay_bytes == expected
+            && self.reference_bytes == expected
+            && self.first_diff.is_none()
+            && self.fatal_error.is_none()
+    }
+}
+
+/// 无硬件端到端：合成源回环 → `Session`（源 + 管线 + 落盘）→ 四方计数 + 逐字节比对。
+fn run_loopback(
+    total_bytes: u64,
+    chunk: usize,
+    display_capacity: usize,
+) -> Result<LoopbackSummary, String> {
+    let chunk = chunk.max(1);
+    let root = temp_session_root("loopback");
+    let store = Arc::new(LogStore::new(&root, STREAM_SEGMENT_BYTES));
+    let source = SyntheticSource::loopback_with_chunk(chunk);
+    let sink = source
+        .try_clone_sink()
+        .map_err(|e| format!("取回环写入句柄失败: {e}"))?;
+    let meta = SessionMeta::new(format!("loopback:synthetic,chunk={chunk}"));
+    let cfg = PipelineConfig {
+        display_capacity,
+        stop_after_bytes: Some(total_bytes),
+        ..PipelineConfig::default()
+    };
+    let session = Session::new(
+        Arc::clone(&store),
+        meta,
+        Box::new(source),
+        Some(Box::new(sink)),
+        cfg,
+    );
+
+    let result = (|| -> Result<LoopbackSummary, String> {
+        session.start().map_err(|e| e.to_string())?;
+
+        // 写侧：用同一份 (seed,total,chunk) 的确定性合成流生成要发的字节，
+        // 这样「发出去的是什么」可以事后独立重建，用于逐字节核对。
+        let gen_cfg = SyntheticConfig {
+            seed: 42,
+            total_bytes,
+            chunk_size: chunk,
+        };
+        let mut generator = SyntheticSource::open(&gen_cfg).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; chunk];
+        loop {
+            let b = generator.read(&mut buf).map_err(|e| e.to_string())?;
+            if b.len == 0 {
+                break;
+            }
+            session
+                .send(&buf[..b.len])
+                .map_err(|e| format!("发送失败: {e}"))?;
+        }
+
+        if !session.wait_until_finished(STREAM_WAIT_TIMEOUT) {
+            return Err(format!(
+                "管线没在 {STREAM_WAIT_TIMEOUT:?} 内读满 {total_bytes} 字节"
+            ));
+        }
+        session.stop().map_err(|e| e.to_string())?;
+        let st = session.stats().map_err(|e| e.to_string())?;
+        let id = session.session_id().ok_or("会话没有 id")?;
+
+        // 排空显示通道：已发出的批次数是已知的，所以这里能确定地排干净。
+        let mut batches_received = 0u64;
+        let mut display_bytes_received = 0u64;
+        while batches_received < st.pipeline.batches_emitted {
+            match session
+                .recv_batch(Duration::from_millis(200))
+                .map_err(|e| e.to_string())?
+            {
+                Some(b) => {
+                    batches_received += 1;
+                    display_bytes_received += b.bytes.len() as u64;
+                }
+                None => break,
+            }
+        }
+
+        // 独立回放：从落盘分片读回，并与「可重建的注入序列」逐字节比对。
+        let mut replay = store
+            .open_replay(&id)
+            .map_err(|e| format!("open_replay 失败: {e}"))?;
+        let mut reference =
+            SyntheticSource::open(&gen_cfg).map_err(|e| format!("打开参照合成源失败: {e}"))?;
+        let diff = compare_streams(&mut reference, &mut replay)?;
+
+        Ok(LoopbackSummary {
+            written_bytes: st.tx_bytes,
+            read_back_bytes: st.pipeline.source_bytes,
+            logged_bytes: st.pipeline.logged_bytes,
+            replay_bytes: diff.actual_bytes,
+            reference_bytes: diff.expected_bytes,
+            first_diff: diff.first_diff,
+            batches_emitted: st.pipeline.batches_emitted,
+            batches_received,
+            display_bytes_received,
+            fatal_error: st.pipeline.fatal_error.clone(),
+        })
+    })();
+
+    if let Err(e) = fs::remove_dir_all(&root) {
+        eprintln!("提示: 清理 {} 失败: {e}", root.display());
+    }
+    result
+}
+
+fn cmd_loopback(args: &[String]) -> ExitCode {
+    let usage = "用法: embhub-cli loopback --bytes N [--chunk K] [--display-capacity C]";
+    let total_bytes: u64 = match arg_value(args, "--bytes") {
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("--bytes 必须是整数: {v}（{e}）\n{usage}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            eprintln!("缺少 --bytes\n{usage}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let chunk: usize = match arg_value(args, "--chunk") {
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("--chunk 必须是整数: {v}（{e}）\n{usage}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => STREAM_DEFAULT_CHUNK,
+    };
+    let display_capacity: usize = match arg_value(args, "--display-capacity") {
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("--display-capacity 必须是整数: {v}（{e}）\n{usage}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => DEFAULT_DISPLAY_CAPACITY,
+    };
+
+    println!("== embhub loopback（无硬件证明「能发」：写入 == 读回 == 落盘 == 回放）==");
+    println!("目标字节数    : {total_bytes}");
+    println!("回环块大小    : {chunk} 字节");
+
+    match run_loopback(total_bytes, chunk, display_capacity) {
+        Ok(s) => {
+            println!("written_bytes           : {}", s.written_bytes);
+            println!("read_back_bytes         : {}", s.read_back_bytes);
+            println!("logged_bytes            : {}", s.logged_bytes);
+            println!("replay_bytes            : {}", s.replay_bytes);
+            println!("reference_bytes         : {}", s.reference_bytes);
+            println!(
+                "display_batches         : {}（收到 {} / 发出 {}）",
+                s.batches_received, s.batches_received, s.batches_emitted
+            );
+            println!("display_bytes_received  : {}", s.display_bytes_received);
+            match s.first_diff {
+                Some(off) => println!("✗ 逐字节比对失败：首个不一致偏移 {off}"),
+                None => println!("✓ 逐字节比对：回放内容与写出的数据完全一致"),
+            }
+            println!(
+                "fatal_error             : {}",
+                s.fatal_error.as_deref().unwrap_or("none")
+            );
+            if s.consistent(total_bytes) {
+                println!(
+                    "✓ 回环闭环通过：写入 == 读回 == 落盘 == 回放 == {total_bytes} 字节（会话：源 + 管线 + 发送）"
+                );
+                ExitCode::SUCCESS
+            } else {
+                println!(
+                    "✗ 回环闭环失败：写入 {} / 读回 {} / 落盘 {} / 回放 {}",
+                    s.written_bytes, s.read_back_bytes, s.logged_bytes, s.replay_bytes
+                );
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("loopback 失败: {e}");
             ExitCode::FAILURE
         }
     }
@@ -1102,6 +1539,206 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(".git"), b"gitdir: /embhub/definitely/not/here\n").unwrap();
         dir
+    }
+
+    // ---- send：参数解析与拒绝空数据 ----------------------------------------
+
+    #[test]
+    fn send_payload_parsing_accepts_hex_and_text() {
+        assert_eq!(
+            parse_send_payload("hex:AA55FF").unwrap(),
+            vec![0xAA, 0x55, 0xFF]
+        );
+        assert_eq!(parse_send_payload("hex: aa 55 ").unwrap(), vec![0xAA, 0x55]);
+        assert_eq!(parse_send_payload("hex:00").unwrap(), vec![0x00]);
+        assert_eq!(parse_send_payload("text:hello").unwrap(), b"hello".to_vec());
+        assert_eq!(
+            parse_send_payload("text:你好").unwrap(),
+            "你好".as_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn send_payload_parsing_rejects_empty_and_garbage() {
+        // 「不得静默发送空数据」：所有空/非法输入都必须 Err。
+        for bad in [
+            "hex:", "hex:   ", "hex:A", "hex:ABC", "hex:ZZ", "hex:AATT", "text:", "", "AA55",
+            "ascii:AA", "hex",
+        ] {
+            assert!(
+                parse_send_payload(bad).is_err(),
+                "{bad:?} 必须被拒绝（不允许静默发送空/非法数据）"
+            );
+        }
+    }
+
+    #[test]
+    fn send_append_terminators_are_exact() {
+        assert_eq!(build_send_frame(b"hi", AppendEnd::None), b"hi".to_vec());
+        assert_eq!(build_send_frame(b"hi", AppendEnd::Cr), b"hi\r".to_vec());
+        assert_eq!(build_send_frame(b"hi", AppendEnd::Lf), b"hi\n".to_vec());
+        assert_eq!(build_send_frame(b"hi", AppendEnd::Crlf), b"hi\r\n".to_vec());
+        assert_eq!(AppendEnd::parse("crlf"), Some(AppendEnd::Crlf));
+        assert_eq!(AppendEnd::parse("CRLF"), None, "大小写不认就是非法");
+        assert_eq!(AppendEnd::parse("nl"), None);
+    }
+
+    #[test]
+    fn send_bad_args_exit_nonzero() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 缺 --port / 缺 --data
+        assert_eq!(cmd_send(&s(&[])), ExitCode::FAILURE);
+        assert_eq!(cmd_send(&s(&["--port", "NOPE"])), ExitCode::FAILURE);
+        assert_eq!(cmd_send(&s(&["--data", "hex:AA55"])), ExitCode::FAILURE);
+        // 非法 --data（这些必须在开端口之前就被拒）
+        assert_eq!(
+            cmd_send(&s(&["--port", "NOPE", "--data", "hex:"])),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            cmd_send(&s(&["--port", "NOPE", "--data", "hello"])),
+            ExitCode::FAILURE
+        );
+        // 非法 --append / --repeat
+        assert_eq!(
+            cmd_send(&s(&[
+                "--port", "NOPE", "--data", "hex:AA55", "--append", "xyz"
+            ])),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            cmd_send(&s(&[
+                "--port", "NOPE", "--data", "hex:AA55", "--repeat", "0"
+            ])),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            cmd_send(&s(&[
+                "--port", "NOPE", "--data", "hex:AA55", "--repeat", "abc"
+            ])),
+            ExitCode::FAILURE
+        );
+        // 空 --port
+        assert_eq!(
+            cmd_send(&s(&["--port", "  ", "--data", "hex:AA55"])),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn send_to_missing_port_exits_nonzero_without_panic() {
+        // 不依赖硬件：端口不存在 → 明确报错、非零退出（不是 panic，也不是「假装发了」）。
+        assert_eq!(
+            cmd_send(&[
+                "--port".to_string(),
+                "EMBHUB_NO_SUCH_PORT".to_string(),
+                "--data".to_string(),
+                "hex:AA55".to_string(),
+            ]),
+            ExitCode::FAILURE
+        );
+    }
+
+    // ---- loopback：无硬件证明「能发」 --------------------------------------
+
+    #[test]
+    fn loopback_three_way_counts_are_equal() {
+        let n = 64 * 1024;
+        let s = run_loopback(n, 4096, 64).unwrap();
+        assert_eq!(s.written_bytes, n, "写入");
+        assert_eq!(s.read_back_bytes, n, "读回");
+        assert_eq!(s.logged_bytes, n, "落盘");
+        assert_eq!(s.replay_bytes, n, "回放");
+        assert_eq!(s.reference_bytes, n);
+        assert_eq!(s.first_diff, None, "回放内容必须与写出的完全一致");
+        assert!(s.fatal_error.is_none());
+        assert!(
+            s.batches_received <= s.batches_emitted,
+            "收到的批次数不可能多于发出的"
+        );
+        assert!(s.consistent(n));
+        assert_eq!(
+            cmd_loopback(&["--bytes".to_string(), n.to_string()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn loopback_bad_args_exit_nonzero() {
+        assert_eq!(cmd_loopback(&[]), ExitCode::FAILURE);
+        assert_eq!(
+            cmd_loopback(&["--bytes".to_string(), "abc".to_string()]),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            cmd_loopback(&[
+                "--bytes".to_string(),
+                "1024".to_string(),
+                "--chunk".to_string(),
+                "x".to_string()
+            ]),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn loopback_zero_bytes_is_a_clean_pass() {
+        let s = run_loopback(0, 4096, 4).unwrap();
+        assert_eq!(s.logged_bytes, 0);
+        assert_eq!(s.replay_bytes, 0);
+        assert!(s.consistent(0));
+        assert_eq!(
+            cmd_loopback(&["--bytes".to_string(), "0".to_string()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn send_frame_repeat_counts_bytes_and_appends_terminator() {
+        #[derive(Default)]
+        struct RecordingSink {
+            written: Vec<u8>,
+            flushes: u32,
+        }
+        impl ByteSink for RecordingSink {
+            fn write_all(&mut self, buf: &[u8]) -> Result<(), embhub_core::SinkError> {
+                self.written.extend_from_slice(buf);
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<(), embhub_core::SinkError> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let mut sink = RecordingSink::default();
+        let frame = build_send_frame(b"AT", AppendEnd::Crlf); // "AT\r\n" = 4 字节
+        assert_eq!(frame, b"AT\r\n".to_vec());
+        let n = write_frame_repeatedly(&mut sink, &frame, 3).unwrap();
+        assert_eq!(n, 12, "3 次 × 4 字节");
+        assert_eq!(
+            sink.written,
+            b"AT\r\nAT\r\nAT\r\n".to_vec(),
+            "终结符每次都带"
+        );
+        assert_eq!(sink.flushes, 3, "每帧都要 flush");
+    }
+
+    #[test]
+    fn send_frame_failure_reports_progress_and_does_not_panic() {
+        struct FailingSink;
+        impl ByteSink for FailingSink {
+            fn write_all(&mut self, _buf: &[u8]) -> Result<(), embhub_core::SinkError> {
+                Err(SourceError::Fatal("设备已拔出（测试用）".to_string()))
+            }
+            fn flush(&mut self) -> Result<(), embhub_core::SinkError> {
+                Ok(())
+            }
+        }
+        let err = write_frame_repeatedly(&mut FailingSink, b"AB", 2).unwrap_err();
+        assert!(err.contains("第 1 次"), "错误必须点明第几次: {err}");
+        assert!(err.contains("已发 0 字节"), "错误必须带上进度: {err}");
+        assert!(err.contains("设备已拔出"));
     }
 
     /// 零字节也要能干净收场（不能因为「等数据」卡死）。

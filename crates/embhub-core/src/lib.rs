@@ -4,9 +4,10 @@
 //! 这样 core 能被 `cargo test` 独立验证，也能被 `embhub-cli` 无头调用。
 //!
 //! 模块契约见 docs/SPEC.md 第 3 节：
-//! - [`source`]：SPEC 3.1 `ByteSource`（seam 之一）。
+//! - [`source`]：SPEC 3.1 `ByteSource`（读）与 `ByteSink`（写）。
 //! - [`store`]：SPEC 3.3 `LogStore`（seam 之二，全项目 depth 最高）。
 //! - [`pipeline`]：PLAN 4.3 流式管线（落盘无损 + 有界显示队列背压）。
+//! - [`session`]：SPEC 3.4 `Session`（源 + 落盘 + 发送的最小实现）。
 //! - [`fingerprint`]：SPEC 3.5 `FirmwareFingerprint`（日志绑固件版本）。
 //! - [`crc`] / [`sha256`]：CRC32 与 SHA-256，纯软件实现，无第三方依赖。
 
@@ -15,6 +16,7 @@
 pub mod crc;
 pub mod fingerprint;
 pub mod pipeline;
+pub mod session;
 pub mod sha256;
 pub mod source;
 pub mod store;
@@ -24,11 +26,16 @@ pub use pipeline::{
     DisplayBatch, Pipeline, PipelineConfig, PipelineStats, StopReason, DEFAULT_BATCH_BYTES,
     DEFAULT_BATCH_TIMEOUT_MS, DEFAULT_DISPLAY_CAPACITY,
 };
-pub use source::{Block, ByteSource, MonoMicros, SourceError, SyntheticConfig, SyntheticSource};
+pub use session::{Session, SessionError, SessionSnapshot};
+pub use source::{
+    describe_serial, mono_now, Block, ByteSink, ByteSource, DataBits, FlowControl, MonoMicros,
+    Parity, SerialConfig, SerialFrame, SerialFrameSettings, SerialSink, SerialSource, SinkError,
+    SourceError, StopBits, SyntheticConfig, SyntheticSink, SyntheticSource,
+};
 pub use store::{
     read_session_header, Chunk, FingerprintSection, LogStore, ReplaySource, SessionHeader,
-    SessionId, SessionMeta, SessionStats, StoreError, FINGERPRINT_NOT_COLLECTED, FORMAT_VERSION,
-    HEADER_MAGIC, RECORD_HEADER_LEN, V1_FINGERPRINT_PLACEHOLDER_LEN,
+    SessionId, SessionMeta, SessionStart, SessionStats, StoreError, FINGERPRINT_NOT_COLLECTED,
+    FORMAT_VERSION, HEADER_MAGIC, RECORD_HEADER_LEN, V1_FINGERPRINT_PLACEHOLDER_LEN,
 };
 
 use serde::Serialize;

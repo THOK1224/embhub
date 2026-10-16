@@ -55,14 +55,14 @@ Write-Host "[B] build, tests, static checks" -ForegroundColor Yellow
 $r = Invoke-Cargo @('test','-p','embhub-core')
 $m = [regex]::Match($r.Text, '(\d+) passed; (\d+) failed')
 $seen = if ($m.Success) { $m.Value } else { 'no "N passed" line' }
-Report 'B1' 'cargo test -p embhub-core  (expect 50 passed / 0 failed)' `
+Report 'B1' 'cargo test -p embhub-core  (expect 76 passed / 0 failed)' `
        ($r.Code -eq 0 -and $m.Success -and [int]$m.Groups[2].Value -eq 0) `
        ("exit={0}  {1}" -f $r.Code, $seen)
 
 $r = Invoke-Cargo @('test','-p','embhub-cli')
 $m = [regex]::Match($r.Text, '(\d+) passed; (\d+) failed')
 $seen = if ($m.Success) { $m.Value } else { 'no "N passed" line' }
-Report 'B2' 'cargo test -p embhub-cli   (expect 17 passed / 0 failed)' `
+Report 'B2' 'cargo test -p embhub-cli   (expect 27 passed / 0 failed)' `
        ($r.Code -eq 0 -and $m.Success -and [int]$m.Groups[2].Value -eq 0) `
        ("exit={0}  {1}" -f $r.Code, $seen)
 
@@ -74,6 +74,13 @@ Report 'B4' 'cargo fmt --check          (expect exit 0, no diff)' ($r.Code -eq 0
 
 $r = Invoke-Cargo @('build','-p','embhub-app')
 Report 'B5' 'cargo build -p embhub-app   (GUI must stay buildable)' ($r.Code -eq 0) ("exit={0}" -f $r.Code)
+
+$r = Invoke-Cargo @('test','-p','embhub-app')
+$m = [regex]::Match($r.Text, '(\d+) passed; (\d+) failed')
+$seen = if ($m.Success) { $m.Value } else { 'no "N passed" line' }
+Report 'B6' 'cargo test -p embhub-app    (expect 17 passed / 0 failed)' `
+       ($r.Code -eq 0 -and $m.Success -and [int]$m.Groups[2].Value -eq 0) `
+       ("exit={0}  {1}" -f $r.Code, $seen)
 
 # ---------------------------------------------------------------- A: zero-loss loops
 Write-Host ""
@@ -134,14 +141,38 @@ Report 'E1' 'Cargo.lock unchanged (zero new downloaded crates)' ($LASTEXITCODE -
 $tauriInCore = [bool](Select-String -Path (Join-Path $root 'crates\embhub-core\Cargo.toml') -Pattern 'tauri' -Quiet)
 Report 'E2' 'embhub-core manifest has no tauri dependency' (-not $tauriInCore) 'tauri found in core manifest'
 
+# ---------------------------------------------------------------- F: send capability
+Write-Host ""
+Write-Host "[F] send capability (ByteSink / Session) - no hardware needed" -ForegroundColor Yellow
+
+$r = Invoke-Cargo @('run','--quiet','-p','embhub-cli','--','loopback','--bytes','1000000')
+Report 'F1' 'loopback 1 MiB             (written == read back == logged == replayed, exit 0)' `
+       ($r.Code -eq 0) ("exit={0}" -f $r.Code)
+
+$r = Invoke-Cargo @('run','--quiet','-p','embhub-cli','--','send','--port','NOPE','--data','hex:AA55')
+Report 'F2' 'send to a missing port    (must exit nonzero, must not panic)' `
+       ($r.Code -ne 0) ("exit={0} (expected nonzero)" -f $r.Code)
+
+$r = Invoke-Cargo @('run','--quiet','-p','embhub-cli','--','send','--port','NOPE','--data','hex:')
+Report 'F3' 'send with an empty payload (must be refused before touching a port)' `
+       ($r.Code -ne 0) ("exit={0} (expected nonzero)" -f $r.Code)
+
 # ---------------------------------------------------------------- summary
 Write-Host ""
 Write-Host ("=== summary: {0} passed, {1} failed ===" -f $script:passes, $script:fails) -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Items this script CANNOT check (need your eyes / your hardware):" -ForegroundColor Yellow
-Write-Host "  G1  cargo run -p embhub-app  -> a window opens and lists serial ports"
-Write-Host "  G2  plug/unplug a USB-serial device, press 'Refresh' -> the list changes"
-Write-Host "  G3  open a port at 115200 while the board transmits -> byte count > 0"
+Write-Host "  G1  cargo run -p embhub-app -> window opens, port list is populated"
+Write-Host "  G2  plug/unplug a USB-serial device, press Refresh -> list changes"
+Write-Host "  G3  Open session on your board's port at 115200 -> status shows running"
+Write-Host "  G4  Receive area: text <-> HEX toggle, Clear, auto-scroll switch all work"
+Write-Host "  G5  Send hex AA5501FF -> the board replies PONG fw=2.0.0 ..."
+Write-Host "  G6  RX/TX counters match what the board actually sent/received"
+Write-Host "  G7  under heavy traffic the 'display dropped' counter is visible (disk is unaffected)"
+Write-Host "  G8  serial params: data bits / parity / stop bits / flow control take effect;"
+Write-Host "      controls lock while running; illegal combos show the exact core reason"
+Write-Host "  G9  receive-area wall-clock timestamp toggle works and matches real time"
+Write-Host "  G10 timed send: interval works; stopping really stops; closing the session stops it"
 Write-Host ""
 
 Pop-Location

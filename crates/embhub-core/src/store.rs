@@ -167,6 +167,33 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// 会话创建时刻的**一对**时钟读数：墙上时钟 + 单调时钟（同一时刻的两面）。
+///
+/// 为什么必须有它：`Block::t_mono` 是单调时钟，屏幕上要显示的是墙上时钟。
+/// 只靠单调值无法还原「当时几点几分」，而用「第一批到达时刻」去近似会话起点，
+/// 会让所有时间戳带上「会话开始到第一字节之间那段沉默」的偏移——沉默越久越错。
+///
+/// 有了这一对值，任意到达时刻的墙上时间都是**精确**的：
+/// `wall_time_ms_for(t_mono)`（误差只来自「读墙上时钟」与「读单调时钟」两次调用之间的
+/// 极短间隔，量级是微秒）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionStart {
+    /// 会话创建时刻的墙上时钟（Unix epoch 毫秒）——与写进会话头的 `start_wall_ms` 同一个值。
+    pub wall_ms: u64,
+    /// 会话创建时刻的单调时钟读数（微秒），与 [`crate::source::mono_now`] /
+    /// [`Block::t_mono`](crate::source::Block) **同一基准**。
+    pub mono_micros: crate::source::MonoMicros,
+}
+
+impl SessionStart {
+    /// 由到达时刻（`t_mono`，微秒）精确换算墙上时钟（Unix epoch 毫秒）。
+    ///
+    /// `t_mono` 早于会话起点（理论上不该发生）时退化为 `wall_ms`，不 panic、不下溢。
+    pub fn wall_time_ms_for(&self, t_mono: crate::source::MonoMicros) -> u64 {
+        self.wall_ms + t_mono.saturating_sub(self.mono_micros) / 1000
+    }
+}
+
 /// 会话统计（自证计数用）：writer 侧自己的账。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionStats {
@@ -176,6 +203,8 @@ pub struct SessionStats {
     pub records: u64,
     /// 已创建的分片数。
     pub segments: u64,
+    /// 会话创建时刻（墙上 + 单调）——精确的换算基准，不是「首批到达时刻」。
+    pub start: SessionStart,
 }
 
 #[derive(Debug)]
@@ -291,6 +320,8 @@ pub fn read_session_header(session_dir: &Path) -> Result<SessionHeader, StoreErr
 
 struct WriterState {
     dir: PathBuf,
+    /// 会话创建时刻的一对时钟读数（精确换算基准）。
+    start: SessionStart,
     sealed: bool,
     cur_file: Option<File>,
     cur_seg_index: u32,
@@ -331,6 +362,13 @@ impl LogStore {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| StoreError::Io(format!("系统时钟异常: {e}")))?
             .as_millis() as u64;
+        // 墙上时钟与单调时钟**背靠背**取：这两个读数共同定义「会话起点」，
+        // 后面所有 Block::t_mono 都由同一个 mono 基准换算墙上时间。
+        let start_mono_micros = crate::source::mono_now();
+        let start = SessionStart {
+            wall_ms: start_wall_ms,
+            mono_micros: start_mono_micros,
+        };
         let seq = self.session_seq.fetch_add(1, Ordering::Relaxed);
         let id = SessionId(format!("s{start_wall_ms:013}-{seq:04}"));
         let dir = self.session_dir(&id);
@@ -362,6 +400,7 @@ impl LogStore {
             id.0.clone(),
             WriterState {
                 dir,
+                start,
                 sealed: false,
                 cur_file: None,
                 cur_seg_index: 0,
@@ -372,6 +411,15 @@ impl LogStore {
             },
         );
         Ok(id)
+    }
+
+    /// 会话创建时刻的 `(墙上时钟, 单调时钟)` 对应关系。
+    ///
+    /// 这是把 `Block::t_mono` 换算成墙上时间的**唯一**精确基准。
+    pub fn session_start(&self, id: &SessionId) -> Result<SessionStart, StoreError> {
+        let writers = self.writers.lock().unwrap();
+        let w = writers.get(&id.0).ok_or(StoreError::UnknownSession)?;
+        Ok(w.start)
     }
 
     /// 追加一条记录。**返回 `Ok` = 已 write_all + flush 到分片文件（不含 fsync）**。
@@ -433,6 +481,7 @@ impl LogStore {
             payload_bytes: w.payload_bytes,
             records: w.records,
             segments: w.segments,
+            start: w.start,
         })
     }
 
@@ -1003,6 +1052,42 @@ mod tests {
         for (_, reason) in back.missing() {
             assert!(!reason.trim().is_empty(), "原因不得为空");
         }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn session_start_is_captured_at_creation_and_matches_the_header() {
+        let root = temp_root("start-pair");
+        let store = LogStore::new(&root, 4096);
+        let before = crate::source::mono_now();
+        let id = store.create_session(&meta()).unwrap();
+        let after = crate::source::mono_now();
+        let start = store.session_start(&id).unwrap();
+
+        // ① 墙上时钟与写进会话头的是同一个值（`s<wall_ms>-<seq>` 也用它命名）。
+        let header = read_session_header(&root.join(&id.0)).unwrap();
+        assert_eq!(start.wall_ms, header.start_wall_ms);
+        assert!(start.wall_ms > 0);
+        // ② 单调读数取自**创建点**：落在 create_session 前后两次取样之间。
+        assert!(
+            start.mono_micros >= before && start.mono_micros <= after,
+            "start.mono={} 不在 [{before}, {after}] 区间内",
+            start.mono_micros
+        );
+        // ③ 换算自洽：起点自身精确对得上，±2.5ms 就是 ±2ms（整数毫秒截断）。
+        assert_eq!(start.wall_time_ms_for(start.mono_micros), start.wall_ms);
+        assert_eq!(
+            start.wall_time_ms_for(start.mono_micros + 2_500),
+            start.wall_ms + 2
+        );
+        assert_eq!(start.wall_time_ms_for(0), start.wall_ms, "早于起点不下溢");
+        // ④ store 侧统计与 session_start 带着同一对读数。
+        assert_eq!(store.stats(&id).unwrap().start, start);
+        // ⑤ 未知会话报错，绝不返回一个假的起点。
+        assert!(matches!(
+            store.session_start(&SessionId("nope".into())),
+            Err(StoreError::UnknownSession)
+        ));
         fs::remove_dir_all(&root).ok();
     }
 

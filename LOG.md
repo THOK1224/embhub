@@ -4,6 +4,288 @@
 
 ---
 
+## 2026-10-16 · 第 16 轮：GUI 挤压缺陷根因修复（t17）验收通过
+
+用户实测报的布局缺陷（接收区内容增长把发送区/事件区挤出可视区、点不到）已由 `t17` 修复并验收（`t18` 由 captain 裁决 pass）。实测：core 76 / cli 27 / **app 17**；clippy / fmt / build 全 0。
+
+### 根因（成员分析，captain 核实后接受——并纠正了 captain 的初判）
+
+旧 CSS 是**两个独立缺陷叠加**：
+
+1. **重叠**：`fieldset { min-height: 0 }` 是**通吃**规则，把内容固定的发送区/事件区也变成可压缩项（body 纵向 flex 默认 `flex-shrink: 1`）→ 被压矮；又因 `overflow` 默认 `visible`，被压矮面板里的行**直接画到下一个兄弟上**。
+2. **把下方顶出去**：`#rx { min-height: 110px }` 这条**硬下限**被捐给接收区的自动最小高度（≈160px）→ 接收区"再挤也不能小于 ~160px"，只能从别人身上抽高度。
+
+**captain 的初判（"滚动容器缺 min-height: 0"）方向对但指错了元素**：关键作用点在**非滚动的 `.pane`**（滚动容器的自动最小尺寸本来就是 0）。真正的错是「`min-height: 0` 发给了不该收的固定区」+「滚动内容又吃了一条 px 下限」。
+
+### 修复（只改约束表达，零写死高度）
+
+`fieldset.fixed { flex: 0 0 auto }`（固定区永不收缩）· `fieldset.pane { flex: 1 1 auto; min-height: 0 }`（接收区是唯一伸缩区）· `#rx { flex: 1 1 auto; min-height: 0; min-width: 0; overflow: auto }`（删掉像素下限）+ `overflow-wrap: anywhere` · `html, body { height: 100% }` 与 body `overflow: auto` 仅作极端小窗口兜底。
+
+**根因注释写在 `<style>` 顶部**（约 40 行），并在 `#rx` 处留下显式禁令「**不许写 min-height: <数字>px —— 那会把下方区域顶出窗口**」。captain 用正则扫全文 `min-height:\s*\d+px` **只命中注释内一处**，无任何真实像素下限。
+
+### 持久闸门
+
+新增 Rust 测试 `layout_invariants_prevent_the_receive_pane_from_squeezing_others`（随 `cargo test` 永远跑），钉住「谁固定/谁伸缩/谁滚动/不许像素凑高/长行可断」。成员另用对照脚本证明闸门**对修复前的 CSS 变红（9 处不满足）**。
+
+> ⚠️ **captain 无法独立复现该 RED**：修复前的 CSS **不在版本控制里**（仓库只有一次 `init` 提交，此后全部工作未提交），取不到旧文件。这是流程缺口，已向维护者建议落实提交。
+
+### captain 的两次自我纠错（都记下来）
+
+1. **误判一（方法问题）**：captain 比较自检页与交付文件 CSS 得 4731 vs 4630，一度质疑"逐字一致"的说法。**逐字符定位后发现差值恰好是 101 个 CR**（自检页 CRLF、交付文件 LF）；统一换行后 **4630 == 4630 且 `-ceq` 为真** ⇒ **成员声明准确，是 captain 的比较方法错了**。
+2. **新证据（成员未取得）**：成员报 headless Edge"零输出"。captain 改为**让 cmd 做文件重定向以绕开 PowerShell 管道**，拿到 2104 字节诊断 —— 真因是 **Chromium mojo `platform_channel` 需要命名管道而被沙箱拒绝（`拒绝访问 (0x5)`）**，crashpad `OpenProcess` 同被拒。这独立证实了"沙箱内无法做像素级量测"，并给出了比"零输出"明确得多的根因。
+
+### 明确移交
+
+「内容增长后下方仍可见可点」「800×600 仍成立」「长行不撑宽」三条的**像素级结论无人验过**，转为用户验收项 **G11**。结构层面（CSS 不变量 + Rust 闸门）已验。另交付自检页 `target\tmp\gui-layout-selfcheck.html`（CSS 与界面逐字一致）供真实浏览器一键量测。
+
+---
+
+## 2026-10-16 · 第 15 轮：G8–G10 用户实测通过；发现 GUI 布局缺陷（已派修）
+
+### 用户侧验收：G8–G10 通过
+
+维护者在普通 shell 里跑新构建，三件事都验到了：
+
+- **G9 时间戳**：接收区出现 `[14:32:03.523] PONG fw=2.0.0 t=12711ms` 这类**墙上时钟**时间戳，与挂钟对得上（说明用的确实是精确换算，不是"首批到达时间"近似）。
+- **G10 定时发送**：事件区可见「定时发送已启动：每 1000 ms 发一帧 4 字节（HEX AA5501FF）」「定时发送已停止：共发出 12 帧 / 5 帧」，启动-停止的计数自洽。
+- **G8 参数**：控件与状态行显示正常（截图里是默认 `8N1 无流控`）；维护者确认通过。
+  > **口径说明**：截图里状态行显示的是**默认 8N1**，所以「非默认参数真机生效」这条证据不在图里。不追问，仅标注。
+
+**顺带核实的一件事**：p1 里 `TX 字节 124` 与 `TX 次数 18` 一开始看着对不平（若都是 4 字节帧应有 31 次写）。captain 去读 `Session::send`（session.rs:224-243）——它是**唯一**更新 tx 计数的地方，每次成功发送同时 `bytes += len` 与 `writes += 1`。据此反推：当前会话 = **5 次定时 PING（4B×5=20）+ 13 次手动 BURST 帧（8B×13=104）= 124 字节 / 18 次写**，**完全自洽**。原来看似矛盾是 captain 把事件区里属于**上一个会话**的「12 帧」条目误算进了当前会话。**计数无 bug，是 captain 算错——记下来以免下次又疑神疑鬼。**
+
+### 新发现：GUI 布局缺陷（用户实测，已派修 t17）
+
+用户截图显示：**接收区内容不断增长时会向下挤压发送区与「事件与错误」区**，最终下方区域被挤出可视区／无法点击（截图里「事件与错误」标题与「定时发送间隔」行重叠、下半截被窗口切掉）。
+
+captain 初判根因：**flexbox 中滚动子项缺少 `min-height: 0`** —— 缺该约束时 flex item 的自动最小尺寸等于内容的 min-content 高度，`overflow: auto` 因此永不生效，容器只会随内容长高并把兄弟节点挤出视口。
+
+据此派 `t17`（implementation，`coder-ds`），明确要求：
+- **根因修复而非症状补丁**：必须说明"为什么"会挤压，并在**修复处写根因注释**；**禁止把某个高度写成固定数字**（那只在某一种窗口尺寸下凑对）。
+- 布局不随内容增长而变；发送区与事件区**始终可见可点**；**800×600 小窗口也成立**；超长行只在接收区内横向滚动、不撑宽页面。
+- 不破坏既有：app 16 条测试不得删除；core 76 / cli 27 一字不改。
+
+> 说明：这个缺陷是**用户在交互验收中发现的**，不是评审产出的 finding。因此按 `implementation` 建任务，而不是 `repair`（后者要求挂 `sourceTaskId` + `sourceFindingIds`，硬套等于伪造来源）。
+
+---
+
+## 2026-10-16 · 第 14 轮：增量 F2（GUI 参数控件 + 时间戳开关 + 定时发送）验收通过
+
+`t14` 一次 attempt 完成，**严格按 captain 的修订版契约执行**（用 `SerialFrame` 而非 `SerialConfig`、停止位只给 1/2、零自定义 parity 规则、时间戳走 `wall_time_ms_for`）。`t16`（review）由 captain 承担，裁决 **pass**（范围限定为适配层 + 静态接线）。
+
+### 交付内容（只改 `crates/embhub-app` 2 个文件）
+
+- `open_session` 改收配置对象 `{port,baud,dataBits,parity,stopBits,flowControl}` → `parse_frame_from_config()` → `SerialFrame::validate()` → `SerialSource::open_with_frame`。
+- 四个参数选择器（**运行时统一禁用** + 状态行显示实际生效帧格式）；接收区 `[HH:MM:SS.mmm]` 时间戳开关（切换无损重渲染）；定时发送（间隔 + 起停 + 状态）。
+- 事件载荷升为 `{seq, t_mono, wall_ms, hex}`，`wall_ms` 在 **Rust 侧**用 core 的精确换算得到。
+
+### captain 独立验收
+
+- 复跑：app **16 passed**（t10 的 8 条逐名全在 + 新增 8 条）、core 76、cli 27、clippy/fmt/check 全 0、loopback 0。
+- **captain 自写正则做静态接线校验**：命令集从 5 升到 **7**（新增 `start_timed_send`/`stop_timed_send`），前后端**双向差集为空**；事件名与载荷键一致；元素 id 引用 27/定义 31/**缺失 0**。
+- **停止位下拉逐行核对**：只有 `value="1"` 与 `value="2"`；全文仅两处 "1.5"——一处 CSS `line-height`，一处是**注释解释为何不提供**。把理由写在最可能被后人加回去的位置，是好习惯。
+- **代码级复核定时发送**：`start_timed_send` 复用与手动发送**同一个 `build_frame`**（一致性是结构性的）；间隔 0 被拒；已在跑时先停旧定时器再起新线程；`close_session` 第一步停定时器并 join，线程另有「session 不在跑即自动退出」第二道闸。四条行为单测覆盖「停后不再发」「关会话自动停」「帧与手动一致」「间隔 0 被拒」。
+- 范围：core/cli 的 mtime 停在 t13 窗口（14:14–14:15），app 为 14:21–14:22；Cargo.lock 未变。
+
+### captain 认领/观察到的两点（不影响验收）
+
+1. **措辞不严谨**：`stop_timed_send` 注释写「幂等：没在跑时返回明确错误」——会报错就不是幂等。**意图是对的**（不静默假装成功），但用词应改为「显式失败」或做成真正幂等。
+2. **遗留物累积**：`target\debug` 下已有两个改名占用的产物（`.locked-20261015` 12.13 MB + `.locked-t14` 12.42 MB，共约 24.5 MB）。已 gitignore，但建议后续清掉，或仅在确需交付 exe 时才重命名（平时用 `cargo check` 佐证编译即可）。
+
+### 明确移交、不予声称
+
+**「点参数控件、看时间戳、开定时发送」三件事没有任何人点过**（沙箱内 WebView2 建窗被拦）。已转为用户验收项 **G8–G10**，写进 [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) 第 3 节（含"若时间戳明显偏移就是真 bug"这类可证伪判据）。
+
+**延续 t13 的未验证项**：四项串口参数**是否真的改变硬件通信行为**仍未真机验证（无第二串口对端、不向未知设备写入）——只能由 G8 用板子验。
+
+### 验收工具同步
+
+- `scripts/accept.ps1`：B1 期望值更新为 76、B6 为 16，人工项提示补 G8–G10；captain 实跑 **19 passed / 0 failed**。
+- `docs/ACCEPTANCE.md`：第 3 节扩为 **G1–G10**，覆盖行补上 F1/F2/C2b。
+
+### 流程：抢单第 6、7 次
+
+`t14` 完成时 coder-ds 立刻空闲，`t16` 又被抢（captain reassign 收回）。**已可确认抢单是空闲成员的默认行为**：不预先占住它，共享池任务必被抢。下一轮起：**建评审任务前先把下一个实现任务建好**。
+
+---
+
+## 2026-10-16 · 第 13 轮：增量 F1（core 串口参数 + 精确时钟）验收通过；**captain 的契约错了两次**
+
+### t13 交付并验收（pass）
+
+`SerialConfig` 只加了 `baud` 的历史结束：新增四个枚举（`DataBits` 5/6/7/8、`Parity` None/Odd/Even、`StopBits` 1/1.5/2、`FlowControl` None/RtsCts/XonXoff）+ `SerialFrame`（四项参数载体，Default = 8N1）；**唯一落点** `build_serial_builder(cfg, frame)` 把四个值真正链到 serialport builder，读写两条路径共用；`validate()` 对非法组合**点名冲突**。时间戳侧新增 `SessionStart { wall_ms, mono_micros }`（create_session 里背靠背取双时钟）→ `SessionSnapshot::wall_time_ms_for(t_mono)` 精确换算。
+
+实测：core **76 passed**（+13）、cli 27、app 8；clippy / fmt 干净；`check -p embhub-app --all-targets` exit 0；回归 5 条全 0；Cargo.lock 未变。
+
+### 一处形状偏离，captain 裁定**接受**
+
+契约要求把四项参数加在 `SerialConfig` 上；实际交付为独立 `SerialFrame` + `open_with_frame(cfg, frame)`。原因链是硬的：`SerialConfig` 被 out-of-scope 的 cli/app 用**完整字面量**构造，Rust 无字段默认值（成员实测 `E0658`），加字段必致 `E0063`；成员先在那两处各补 `..SerialConfig::default()`，**被平台门禁以 `crates/embhub-cli/src/main.rs is out_of_scope` 拒绝**，于是改为不动那两个文件。
+
+**captain 独立核实（未采信自述）**：cli/app 中只匹配到原有 `SerialConfig {` 字面量，**无 `..Default::default()`、无 `SerialFrame` 引用** ⇒ 临时 6 行确无残留；`build_serial_builder` 确实把四个值全链上 builder；`open(cfg)` 有明确的 8N1 文档并委托给 `open_with_frame`，**不是静默陷阱**。
+
+**裁定理由**：「帧格式（数据位/校验/停止位）」本就是串口既有术语，与 `SerialConfig`（端点 + 超时）分层是更清晰的划分；目标（四项可配、真正生效、非法组合点名报错、有测试）全部达成；成员遇阻时**遵守平台门禁而不是绕开**——这是本轮最值得肯定的行为。**契约里的"加在 SerialConfig 上"是手段而非目的，captain 承认自己过度指定了实现形状。**
+
+### captain 认领的两处契约错误（重要）
+
+1. **1.5 停止位**：captain 在契约里要求支持 1/1.5/2，但 serialport 4.10.1 的 `StopBits` 只有 `One`/`Two`（成员读 `.cargo` 源码确认）。成员**拒绝静默折算**、让 `StopBits::OneAndHalf` 返回明确错误——正确处理。
+2. **"parity 与 data_bits 的非法搭配"是 captain 凭空写的规则**，真实平台（serialport 枚举 / Win32 DCB / 16550）**不存在**该限制。成员**明确拒绝编造假规则**，只实现了两类真实冲突（5 数据位+2 停止位；6/7/8 数据位+1.5 停止位）——这个判断值得肯定。
+
+据此已用 `agent_teams_amend_task` **修订 t14 契约**（记录 1 版修订）：改用 `SerialFrame`/`open_with_frame` 形状、停止位只给 1 和 2、删去 parity×data_bits 要求、时间戳指定用 `wall_time_ms_for(t_mono)`。**注意：修订时 t14 已被领取**，故 captain 另发一条消息把三处变更直接告知实现者，避免它按废止的契约干活。
+
+### app build 的 exit 101 不是编译错误
+
+`cargo build -p embhub-app` 报 101，真因是 **PID 12452（13:44:57 启动，用户的 GUI 交互验收实例）占用了 exe**，无法重链接。captain 核实：该进程确实在跑，且 `cargo check -p embhub-app --all-targets` exit 0 ⇒ 编译无问题。成员**没有杀掉用户的 GUI** 去凑绿 build，处理正确。
+
+### 已知未验证项（如实保留）
+
+四项参数**是否真的改变了硬件通信行为**未做真机验证：本机没有第二个串口对端，且我们不向未知设备写入（沿用既有约束）。当前证据只有「枚举→serialport 映射单测」+「唯一落点代码复核」。真机验证留到 t14 界面做好后，由用户用板子试非 8N1 参数。
+
+### 流程
+
+本次评审任务**没有发生抢单**——因为 coder-ds 当时正忙 t14。再次印证：**让成员保持有事做**是解决"共享池任务被空闲成员抢单"的正解。
+
+---
+
+## 2026-10-16 · 第 12 轮：G1–G7 用户实测通过（captain 独立核了落盘日志）；转向「界面完善」
+
+### 用户侧验收结果（G1–G7）
+
+维护者在普通 shell 里跑通了全部 7 条：端口列表填充（这次是 `COM13 [usb] VID:PID=1A86:7523 USB-SERIAL CH340`）、插拔刷新、打开/关闭会话、接收区文本↔HEX、**真机发送成功**（发 `AA55080A001000FF` → 板子回 `BURST START count=10 size=16` + 10 行 + `BURST DONE`；另有两次 `AA5501FF` → `PONG fw=2.0.0`）、RX/TX 计数、按键上报都能看到。
+
+### captain 的独立核验：拿用户这次真实会话的落盘日志做字节级解析
+
+会话目录 `target\debug\embhub-data\sessions\s1792129848436-0000`，用**纯 PowerShell 按格式遍历**（不碰任何 Rust 代码）：
+
+| 项 | 值 |
+| --- | --- |
+| `header.bin` | 135 字节；magic `EMBHLOG`、**version=2**、`source_config = serial:COM13@115200`；账目 24+88+4+19 = **135 == 实际** ✓ |
+| `seg-000000.bin` | 2487 字节；**78 条记录**、payload 总字节 **1239**、未成记录尾部 0 |
+| 与界面显示对比 | 界面 RX **1239** ⇒ **磁盘上就是 1239，完全一致** |
+
+**这是端到端真机证据：GUI → core → 落盘，一个字节不差。** 也是本项目第一次用"用户在真机上跑出来的会话"做独立核对。
+
+### 一处必须记录的 captain 疏漏：**GUI 会话没有固件指纹**
+
+同一次解析里，指纹段内容是：
+
+```
+not_collected = '会话创建时未提供固件指纹（未采集）'
+```
+
+也就是说**从 GUI 开出来的每一个会话都不带指纹**。SPEC 3.5 明确要求"采集时机：会话创建时"，而 B1/B2 两轮做出来的指纹能力**在产品主界面（GUI）上是隐形的**。
+
+**根因是 captain 定 t10 契约时的疏漏**：`open_session(port, baud)` 根本没给指纹留位置。这不是实现者的问题——它严格按契约做了。
+
+**已登记为待办项（增量 D）**：把指纹采集接进 `open_session`。维护者本轮选择了先做界面完善（增量 F），所以 D 延后。
+
+### 三条如实记录
+
+1. **`os error 5` 已定性**：日志里 `[13:54:52] 采集已停止（致命错误）：读取失败: 拒绝访问。(os error 5)`，维护者确认是**当时断开了板子与 PC 的连接**。因此这是预期行为，不是 bug。附带好消息：随后点「关闭会话」日志被**正常 seal**，1239 字节完整落盘，降级行为正确。
+2. **维护者对"错误提示"的原则（captain 完全同意并采纳）**：「拔线后给出清晰提示，**如果你真的能做到判明当前采集终止是什么原因，你就做，不然不要做以免误导**」。据此：**不做猜原因的错误文案**，只在能**确证**原因时给具体诊断；**不做"一键重连"**（维护者认为没必要）。
+3. **G7 的"看到丢弃计数变化"未获证据**：截图里显示丢字节为 **0**（只发了约 200 字节的 BURST，远不足以触发背压）。计数器的**存在**验到了；"看到它变化"没验到。但背压路径本身已由 C1/C3 的**显示 100% 丢弃**对抗测试独立证明，故不视为风险——只是把话说准。
+
+### 下一步：增量 F（用户指定「先完善串口助手界面」）
+
+按**层**拆两个任务，避免同时改同一批文件：
+
+| 任务 | 内容 | 依赖 |
+| --- | --- | --- |
+| **t13（core）** | `SerialConfig` 扩 数据位/校验位/停止位/流控 并**真正应用到 serialport**；非法组合给具体冲突错误；另暴露精确的 `(start_wall_ms, start_mono_micros)` 对应关系 | — |
+| **t14（GUI）** | 四个参数控件（`open_session` 改收配置对象）；接收区**墙上时钟时间戳开关**；**定时发送**（间隔+启停，关会话自动停） | t13 |
+
+契约里两条防坑要求：① **运行中参数控件必须禁用**，避免"界面显示 115200 实际跑 9600"这类误导；② 时间戳**必须用精确对应关系换算**，**不得用"第一批到达时间"近似冒充会话起始**（那会引入等于沉默时长的偏移）。
+
+明确**不做**：导出/保存接收内容到文件——那需要系统文件对话框（引入新 crate，沙箱无网络装不了），留到后续用"路径输入框 + 保存命令"的零依赖做法。
+
+---
+
+## 2026-10-16 · 第 11 轮：增量 C2b（GUI 串口助手面板）验收通过——**但交互部分明确移交用户**
+
+`t10`（implementation，`coder-ds`）一次 attempt 完成；captain 建 `t12`（review）并亲自裁决 **pass**，但**范围限定为「适配层与接线」**。
+
+### 交付内容（只动 `crates/embhub-app`，3 个文件）
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/main.rs` | 4 个命令 `open_session(port,baud)` / `close_session()` / `session_stats()` / `send_data(data,mode,append)`（保留 `list_ports`）；事件 `session-batch` 载荷 `{seq,t_mono,hex}`；**删掉 spike 专用的 `read_probe`**；建窗失败从裸 panic 改为明确错误 + 排查提示 + exit 1；8 个单测 |
+| `ui/index.html` | 重写为串口助手：刷新端口 / 选端口与波特率 / 打开·关闭（按钮状态随会话变）/ 接收区 文本↔HEX / 清空 / 自动滚动 / 发送区 文本·HEX + none·CR·LF·CRLF / RX·TX·显示丢弃 三计数 / 错误面板。原生 HTML/JS，零构建依赖 |
+| `capabilities/default.json` | 显式补 `core:event:default` |
+
+### captain 独立验收
+
+- 复跑：`build -p embhub-app` exit 0；clippy/fmt 干净；core **63** / cli **27**（与 t9 完全一致 ⇒ core 与 CLI 未动）；**app 8 passed**；`loopback` 与 `list` exit 0。
+- **captain 自己写正则做静态接线校验**（不采信实现者的 Python 脚本）：后端注册命令集与前端 `invoke` 集**完全对称**（5 个，双向差集为空）；`emit`/`listen` 事件名一致（`session-batch`）；前端 18 个 `getElementById` 引用**全部有定义**（缺失 0）；另核实 3 个"定义但未被 getElementById 引用"的 id 均正当（`bauds` 是 `<datalist>`、`counters` 是 CSS 容器、`rxHint` 是静态提示）；无 import / require / node_modules / 外链 script ⇒ 零构建依赖成立。
+- **范围用两道证据**：git status 仅 `crates/embhub-app/**`；core/src、cli/src 的 mtime 停在 t9 的时间窗（13:14–13:15），app 为 13:20–13:23。
+- **代码级复核事件泵**：`pump_batches` 在会话结束后用 0 超时**排空尾部批次**再退出（否则最后几批"已落盘没上屏"）；其单测 `pump_turns_core_batches_into_events` **故意不置 stop 标志**、逼泵自己走该路径，再断言 `seq` 从 1 起严格递增——真在测那条路径。
+
+### 明确移交、不予声称的部分（本轮最重要的一条）
+
+**交互式 GUI 验收未完成。** DSH 沙箱内 WebView2 创建必失败（`HRESULT(0x8000FFFF)`）；实现者把 `EMBHUB_DATA_DIR` 改到沙箱允许位置后重试结果相同，据此判定为**环境限制而非代码问题**（与 Phase 0 spike 当年的现象一致，那次是用户在沙箱外启动才成功）。
+
+实现者**如实声明"没有实际点过界面"**，没有把静态校验冒充成交互验收——处理正确。captain 同样**不声称**这一段已完成，把它拆成 7 条用户验收项 **G1–G7** 写入 [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md)：窗口/端口列表、插拔刷新、打开会话、接收区三操作、**发 `AA5501FF` 看板子回不回 `PONG`**、RX/TX 计数对账、高流量下显示丢弃可见而 RX 不停。
+
+### 裁定：**不需要**加 headless 自检入口
+
+实现者提议给适配层加 headless 自检入口来"补上 GUI 的自证缺口"。**captain 否决**：适配层逻辑（命令、事件泵、DTO 映射、hex/append 解析）已由 8 个单测覆盖（泵用真回环会话），再加 headless 入口只会重复跑同一批函数，**无法覆盖真正的缺口（WebView2 渲染与 DOM 交互）**。为把"不可自证"改造成"看着可自证"而在生产代码里加测试专用入口，是花架子而不是证据——缺口应如实移交人工。
+
+### 验收工具同步更新
+
+- `scripts/accept.ps1`：**19 项自动检查**（新增 B6 app 测试、F1–F3 发送能力），captain 实跑 **19 passed / 0 failed**；人工项提示改为 G1–G7。
+- `docs/ACCEPTANCE.md`：补充 F 组（发送能力）、重写第 3 节为 G1–G7 带操作步骤与失败处置、更新第 5 节诚实清单、第 6 节可证伪点新增 4 条 GUI 相关（含"G5 板子不回而别的串口助手能回"这种最关键的对照）。
+
+### 流程问题（第 5 次，根因已确认）
+
+`t12` 又被抢（t10 一完成 coder-ds 就空闲）。**根因确认**：成员空闲时共享池任务会被立即抢单。**解法**：先把下一个实现任务建好占住成员，再建评审任务。
+
+---
+
+## 2026-10-16 · 第 10 轮：目标转向「串口助手基本功能」；增量 C2a（发送能力 + Session）验收通过
+
+### 目标调整
+
+维护者明确：**当前核心目标是实现串口助手的基本功能**。据此把工作重心从"日志可追溯"转到"可用"。
+
+差距诊断：C1 的流式管线**只能读**。SPEC 里 `ByteSource` 是只读接口，所以"发送"必须作为**另一项能力**引入，而不是往 `ByteSource` 里塞 `write`。于是拆成两个任务：
+
+| 任务 | 内容 | 状态 |
+| --- | --- | --- |
+| **t9** | core：`ByteSink` 发送能力 + `Session` 最小实现 + `cli send` / `cli loopback` | ✅ 已验收 |
+| **t10** | GUI：串口助手面板（打开/关闭 + 接收显示 + 发送 + 计数） | 依赖 t9，进行中 |
+
+### t9 交付内容
+
+| 文件 | 内容 |
+| --- | --- |
+| `core/src/source.rs` | 新增 `ByteSink { write_all, flush }`（`SinkError = SourceError`，因读写失败模式同构）；`SerialSource::try_clone_sink()` 用 serialport `try_clone()` 给出**共享同一物理端口**的写句柄；`SyntheticSource::loopback()` 给**回环**写句柄 |
+| `core/src/session.rs`（新） | SPEC 3.4 最小实现：`start`/`stop`（幂等）/`stats`（含 tx 计数，停后仍可读）/`recv_batch`/`send` |
+| `cli/src/main.rs` | `loopback --bytes N`（回环四方一致 + 逐字节比对）、`send --port <p> --data <hex:…\|text:…> [--append …] [--repeat N]` |
+
+**`ByteSink` 单独成 trait 的理由**（实现者写在模块注释里，captain 认可）：发送不是"反过来读"——读句柄与写句柄可以是两个独立对象，失败模式也不同；并进 `ByteSource` 会逼着回放源这种"天然只能读"的实现去实现写方法。
+
+### captain 独立验收
+
+- 复跑 7 条 verify：core **63 passed**、cli **27 passed**、clippy/fmt 干净、`loopback --bytes 1000000` exit 0（written == read_back == logged == replay == reference == 1000000，display 16/16，逐字节一致）、`send --port NOPE` exit 1（契约要求）、`build -p embhub-app` exit 0；回归 6 条全 0。
+- **captain 自加的验证**：① `loopback --bytes 0 / 1 / 1000001`（边界与非整数尺寸，实现者只跑了 1000000）；② 逐一实跑 5 种非法 `send` 输入，确认错误原因**具体到可操作**（"缺少 --data（不允许静默发送空数据）"这类），不是笼统失败；③ **测试名差集由 captain 独立重做**（上轮 50+17 逐条在新 63+27 中查到，零删除零改名，新增 23 条）。
+- 代码级复核：`RecordingSink` 单测断言的是**确切字节与 flush 次数**（`AT\r\nAT\r\nAT\r\n`、12 字节、flush 3 次），不是"调用成功即通过"；失败路径的错误串带「第几次 / 已发多少字节 / 底层原因」，对 GUI 诊断友好。
+
+### captain 明确背书的一处克制行为（值得记下）
+
+实现者主动声明：**没有对任何真实串口写入**。本机存在 COM3..COM12，向未知设备写字节属硬件副作用（可能复位设备、使其进入 bootloader 等），未经许可不做。
+
+**captain 背书并维持该约束。** 因此 `send` 的成功路径由「回环端到端（经 Session）」+「RecordingSink 单测」覆盖；**真实物理端口的发送未验证，是设计上的有意保留**，已转为用户侧验收项（GUI 接上后在真机点一次发送，看板子是否回帧）。
+
+### 流程：困扰四轮的"评审任务被抢"根因找到了
+
+前四轮（t2/t4/t6/t8）评审任务建好后都被调度器**立即派给空闲的 coder-ds**，captain 每次都得中断它再收回。本轮 **t9 完成时 t10 立刻就绪并占住了 coder-ds**，调度器没有空闲成员可抢——t11（评审）顺利直接归 captain。
+
+**根因**：共享池任务会被**空闲成员**立即抢单。
+**解法**：让成员保持有事做（任务排队），或任务一就绪就立刻 reassign。此前"提前建 + 加依赖"之所以无效，是因为任务一旦变可就绪就会被抢。
+
+### 下一步
+
+`t10`（GUI 串口助手面板）进行中。契约里已把适配层边界钉死：4 个命令（`open_session`/`close_session`/`session_stats`/`send_data`）+ 1 个事件（`session-batch`，载荷 `{seq, t_mono, hex}`），且 `crates/embhub-app/` 是 t10 唯一可改范围——core 与 CLI 一行不许动。
+
+---
+
 ## 2026-10-16 · 第 9 轮：增量 C1（core 流式管线 + 背压）交付并验收通过
 
 `t7`（implementation，`coder-ds`）一次 attempt 完成；captain 建 `t8`（review，**带 t7 依赖**以防被抢）并亲自承担，裁决 **pass**。

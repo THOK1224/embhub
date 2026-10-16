@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"主窗口的默认能力","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"主窗口的默认能力；core:event:default 是接收区用 listen('session-batch') 收显示批次所必需的（core:default 已含它，这里显式写出以表明依赖）","local":true,"windows":["main"],"permissions":["core:default","core:event:default"]}}

@@ -23,7 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::source::{ByteSource, MonoMicros, SourceError};
-use crate::store::{Chunk, LogStore, SessionId, SessionMeta, StoreError};
+use crate::store::{Chunk, LogStore, SessionId, SessionMeta, SessionStart, StoreError};
 
 /// 批量推送的字节阈值（PLAN 4.3：≥8 KB）。
 pub const DEFAULT_BATCH_BYTES: usize = 8 * 1024;
@@ -116,6 +116,9 @@ impl StopReason {
 /// `display_bytes_dropped`（显示丢了，但报出来了）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineStats {
+    /// 会话创建时刻的 `(墙上时钟, 单调时钟)`：把 `Block::t_mono` 换算成墙上时间的**精确**基准。
+    /// 它不是「第一批到达时刻」——那会让所有时间戳带上「开始到首字节之间那段沉默」的偏移。
+    pub session_start: SessionStart,
     /// 从来源读到的字节总数。
     pub source_bytes: u64,
     /// 成功 append 进 LogStore 的字节总数。
@@ -180,6 +183,9 @@ fn load(counter: &AtomicU64) -> u64 {
 pub struct Pipeline {
     store: Arc<LogStore>,
     session: SessionId,
+    /// 建会话那一刻的 `(墙上时钟, 单调时钟)`：**在 spawn 时取一次并缓存**，
+    /// 免得每次 `stats()` 都去问一次 store（也就不可能被后来的调用“漂移”）。
+    session_start: SessionStart,
     counters: Arc<Counters>,
     stop_flag: Arc<AtomicBool>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -197,6 +203,8 @@ impl Pipeline {
         cfg: PipelineConfig,
     ) -> Result<Self, StoreError> {
         let session = store.create_session(&meta)?;
+        // 会话起点紧跟在 create_session 之后取：它就是「会话创建点」的那对时钟读数。
+        let session_start = store.session_start(&session)?;
         let (tx, rx) = std::sync::mpsc::sync_channel(cfg.display_capacity);
         let counters = Arc::new(Counters::default());
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -215,11 +223,17 @@ impl Pipeline {
         Ok(Self {
             store,
             session,
+            session_start,
             counters,
             stop_flag,
             handle: Mutex::new(Some(handle)),
             display_rx: Mutex::new(Some(rx)),
         })
+    }
+
+    /// 会话创建时刻的 `(墙上时钟, 单调时钟)` 对应关系（精确换算基准）。
+    pub fn session_start(&self) -> SessionStart {
+        self.session_start
     }
 
     /// 会话 id（回放、读会话头都用它）。
@@ -237,6 +251,7 @@ impl Pipeline {
     /// 计数快照。**停止之后仍然可读**（这就是它不借用线程状态的原因）。
     pub fn stats(&self) -> PipelineStats {
         PipelineStats {
+            session_start: self.session_start,
             source_bytes: load(&self.counters.source_bytes),
             logged_bytes: load(&self.counters.logged_bytes),
             reads: load(&self.counters.reads),
@@ -880,6 +895,39 @@ mod tests {
             "错误必须点明是落盘路径: {st:?}"
         );
         finish(&pipeline);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 管线快照里的会话起点必须与 store 记的是同一个（否则换算会两套基准）。
+    #[test]
+    fn pipeline_stats_expose_the_store_session_start() {
+        let root = temp_root("start");
+        let store = Arc::new(LogStore::new(&root, 1 << 20));
+        let src = ScriptSource::new(vec![Step::Data(1000)], 1000);
+        let cfg = PipelineConfig {
+            stop_after_bytes: Some(1000),
+            poll_when_empty: Duration::from_millis(1),
+            ..PipelineConfig::default()
+        };
+        let pipeline = Pipeline::spawn(Arc::clone(&store), meta(), Box::new(src), cfg).unwrap();
+        let from_pipeline = pipeline.session_start();
+        finish(&pipeline);
+        let from_store = store.session_start(pipeline.session_id()).unwrap();
+        assert_eq!(from_pipeline, from_store, "管线与 store 的会话起点必须一致");
+        let stats = pipeline.stats();
+        assert_eq!(stats.session_start, from_store);
+        assert!(stats.session_start.wall_ms > 0);
+        // 由到达时刻换算墙上时间：起点自身精确相等，且随 t_mono 单调不减。
+        assert_eq!(
+            stats.session_start.wall_time_ms_for(from_store.mono_micros),
+            from_store.wall_ms
+        );
+        assert!(
+            stats
+                .session_start
+                .wall_time_ms_for(from_store.mono_micros + 10_000)
+                >= from_store.wall_ms + 10
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
