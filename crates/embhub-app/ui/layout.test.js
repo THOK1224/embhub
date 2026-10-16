@@ -118,7 +118,9 @@ check("扫一批尺寸 × 可见性组合，逐个断言 ≥ 最小值且总和�
           );
         }
         // 可见区域个数必须与矩形个数一致（不可见的不许产出矩形）
-        const visibleIds = Object.keys(visible).filter((id) => visible[id]);
+        // 注意：只看**这棵树**里的区域 —— 区域表在 H2 之后还有侧边栏与 SSH/Git 占位区域，
+        // 它们不在这棵树里，自然也不该有矩形。
+        const visibleIds = L.treeRegions(L.TREE).filter((id) => visible[id]);
         assert(
           visibleIds.length === Object.keys(r.rects).length,
           `矩形个数应等于可见区域个数（${visibleIds.length} vs ${Object.keys(r.rects).length}）`
@@ -268,7 +270,10 @@ check("比例越界被夹到 [RATIO_MIN, RATIO_MAX]", () => {
 check("未知区域 id 不会污染状态", () => {
   const s = L.normalizeState({ visible: { 幽灵区: true }, ratios: { 幽灵区: 3 } });
   assert(s.visible["幽灵区"] === undefined, "未知 id 不该出现");
-  assert(Object.keys(s.visible).length === 4, "只应有四个已知区域");
+  assert(
+    Object.keys(s.visible).length === Object.keys(L.REGIONS).length,
+    "只应包含区域表里登记的区域（不多不少）：" + Object.keys(s.visible).join(",")
+  );
 });
 
 console.log("== 6. 拖拽：钉住尺寸、等量反向、双侧最小值 clamp（t24）==");
@@ -402,6 +407,130 @@ check("**最后一个可见区域**：即使它是可关的，也必须拒绝并
   assert(verdict.reason.indexOf("最后一个可见区域") >= 0, "原因要说清是「最后一个」：" + verdict.reason);
   assert(L.canHide({ a: true, b: true }, "a", regs).ok === true, "还有别的可见时应该放行");
   assert(L.canHide({ a: true }, "幽灵区", regs).ok === false, "未知区域要拒绝");
+});
+
+console.log("== 8. H2：功能区侧边栏 / 每功能区域树 / 按功能持久化 ==");
+check("三个功能区与各自的区域树一一对应（串口=四区；SSH/Git 各自只有一个占位区）", () => {
+  assert(L.FUNCTION_ORDER.join(",") === "serial,ssh,git", "功能区顺序：" + L.FUNCTION_ORDER.join(","));
+  const serial = L.functionRegions("serial");
+  assert(serial[0] === L.SIDEBAR_ID, "侧边栏必须是每个功能里的第一个区域：" + serial.join(","));
+  for (const id of L.REGION_ORDER) {
+    assert(serial.indexOf(id) > 0, "串口助手必须有区域 " + id + "：" + serial.join(","));
+  }
+  for (const fn of ["ssh", "git"]) {
+    const regs = L.functionRegions(fn);
+    assert(regs.length === 2, fn + " 应当只有「侧边栏 + 一个占位区」：" + regs.join(","));
+    assert(regs[0] === L.SIDEBAR_ID && regs[1] === fn, fn + " 的区域树应是 [sidebar, " + fn + "]：" + regs.join(","));
+  }
+});
+
+check("侧边栏本身是布局树里的区域：不可关闭、有自己的最小宽度、参与求解", () => {
+  const sb = L.REGIONS[L.SIDEBAR_ID];
+  assert(sb && sb.closable === false, "侧边栏必须不可关闭");
+  assert(sb.minW > 0 && sb.minH > 0, "侧边栏必须有自己的非零最小尺寸");
+  assert(L.canHide(allVisible(), L.SIDEBAR_ID).ok === false, "侧边栏不许被关掉");
+  // 参与求解：串口视图里侧边栏占一条轨道，且把主体挤掉一块（不是浮层）
+  const tree = L.FUNCTIONS.serial.tree;
+  const solved = L.solve({ tree: tree, size: BIG });
+  assert(solved.tracks.shell && solved.tracks.shell.sizes.length === 2, "外壳应有两条轨道（侧边栏 + 主体）");
+  assertClose(solved.tracks.shell.sizes[0], sb.minW, 0.5, "侧边栏默认就是自己的最小宽度（weight 0）");
+  assert(solved.rects[L.SIDEBAR_ID].w >= sb.minW, "侧边栏宽度不得低于最小值");
+  assert(solved.rects.params.w >= L.REGIONS.params.minW, "主体里的区域仍不得低于各自最小值");
+  assertClose(
+    solved.tracks.shell.sizes[0] + 8 + solved.tracks.shell.sizes[1],
+    BIG.width,
+    0.5,
+    "侧边栏 + 间隙 + 主体应铺满整宽（侧边栏吃掉了宽度，不是浮层）"
+  );
+});
+
+check("占位视图（SSH/Git）：唯一区域铺满主体，且不会被判低于最小值", () => {
+  for (const fn of ["ssh", "git"]) {
+    const tree = L.FUNCTIONS[fn].tree;
+    const solved = L.solve({ tree: tree, size: BIG });
+    assert(solved.rects[fn] !== undefined, fn + " 占位区域必须有矩形");
+    assert(solved.rects[fn].w >= L.REGIONS[fn].minW, fn + " 占位区域不得低于最小值");
+    assertClose(solved.rects[fn].w, BIG.width - L.REGIONS[L.SIDEBAR_ID].minW - 8, 0.5, fn + " 占位区域应铺满主体");
+    assertClose(solved.rects[fn].h, BIG.height, 0.5, fn + " 占位区域应铺满整高");
+    assert(Object.keys(solved.rects).length === 2, fn + " 视图里只应有两个区域：" + Object.keys(solved.rects).join(","));
+  }
+});
+
+check("默认工作区：三个功能各自独立、旧格式整块当串口助手的布局读回", () => {
+  const ws = L.defaultWorkspace();
+  assert(ws.current === "serial", "默认停在串口助手");
+  for (const id of L.FUNCTION_ORDER) {
+    assert(ws.functions[id] && ws.functions[id].visible && ws.functions[id].ratios, "功能 " + id + " 必须有独立状态");
+  }
+  assert(
+    Object.keys(ws.functions.serial.visible).length === Object.keys(L.REGIONS).length,
+    "每个功能的状态都覆盖整张区域表"
+  );
+  // **旧格式回退**：以前存的就是 `{visible, ratios, sizes}` 这一块，必须能安全读回
+  const legacy = { visible: { tx: false, events: false }, ratios: { rx: 2 }, sizes: { left: 420 } };
+  const back = L.normalizeWorkspace(JSON.stringify(legacy));
+  assert(back.current === "serial", "旧格式没有 current → 回到串口助手");
+  assert(back.functions.serial.visible.tx === false, "旧格式的可见性必须落到串口助手上");
+  assertClose(back.functions.serial.ratios.rx, 2, 1e-9, "旧格式的比例必须落到串口助手上");
+  assertClose(back.functions.serial.sizes.left, 420, 1e-9, "旧格式的钉住尺寸必须落到串口助手上");
+  assert(back.functions.ssh.visible.tx === L.REGIONS.tx.defaultVisible, "没有旧数据的功能取默认");
+});
+
+check("按功能分别持久化：各功能的开关/比例/尺寸互不串味，且往返一致", () => {
+  const ws = L.defaultWorkspace();
+  ws.current = "ssh";
+  ws.functions.serial.visible.tx = false;
+  ws.functions.serial.ratios.rx = 3;
+  ws.functions.serial.sizes.left = 500;
+  ws.functions.ssh.visible.events = false; // 占位功能里也允许记录（回退时按区域表规整）
+  ws.functions.git.ratios.rx = 1.25;
+  const back = L.normalizeWorkspace(L.serializeWorkspace(ws));
+  assert(back.current === "ssh", "上次选中的功能必须记住");
+  assert(back.functions.serial.visible.tx === false, "串口助手的开关必须各自记住");
+  assertClose(back.functions.serial.ratios.rx, 3, 1e-9, "串口助手的比例必须各自记住");
+  assertClose(back.functions.serial.sizes.left, 500, 1e-9, "串口助手的钉住尺寸必须各自记住");
+  assert(back.functions.serial.ratios.rx !== back.functions.git.ratios.rx, "两个功能的同名比例必须互不影响");
+  // 切换功能不得改变另一个功能的状态
+  const before = JSON.stringify(back.functions.serial);
+  back.current = "git";
+  assert(JSON.stringify(back.functions.serial) === before, "切功能不许动别的功能的布局");
+});
+
+check("工作区坏数据一律回退，不崩也不产生非法布局", () => {
+  for (const raw of [
+    null, undefined, "", "{", "[]", "42", "[1,2,3]", { current: "幽灵功能" },
+    { functions: { serial: null, ssh: 7, git: "x" } }, { functions: [] },
+    { version: 1, visible: "x", ratios: [1], sizes: "y" },
+  ]) {
+    const ws = L.normalizeWorkspace(raw);
+    assert(L.FUNCTION_ORDER.indexOf(ws.current) >= 0, "current 必须是已知功能：" + ws.current);
+    for (const id of L.FUNCTION_ORDER) {
+      const st = ws.functions[id];
+      assert(st && st.visible && st.ratios && st.sizes, "功能 " + id + " 必须是合法状态");
+      assert(st.visible[L.SIDEBAR_ID] === true, "侧边栏在任何回退路径下都必须可见");
+      for (const rid of Object.keys(st.ratios)) {
+        const v = st.ratios[rid];
+        assert(Number.isFinite(v) && v >= L.RATIO_MIN && v <= L.RATIO_MAX, "比例越界：" + rid + "=" + v);
+      }
+    }
+    // 回退出来的状态拿去求解必须仍然合法（不得产生非法布局）
+    const solved = L.solve({ tree: L.FUNCTIONS[ws.current].tree, size: BIG, visible: ws.functions[ws.current].visible });
+    for (const rid of Object.keys(solved.rects)) {
+      assert(solved.rects[rid].w >= 0 && solved.rects[rid].h >= 0, "回退后求解出了非法矩形");
+    }
+  }
+});
+
+check("求解器仍然只有一份：功能树只是数据，求解逻辑没有第二份", () => {
+  const keys = Object.keys(L);
+  assert(keys.filter((k) => k === "solve").length === 1, "只应导出一个 solve");
+  assert(typeof L.solve === "function", "solve 必须是函数");
+  // 功能树是**数据**（含 children/kind），页面只负责把它交给同一个 solve
+  for (const id of L.FUNCTION_ORDER) {
+    const tree = L.FUNCTIONS[id].tree;
+    assert(tree && tree.kind === "cols" && Array.isArray(tree.children), id + " 的树必须是可被 solve 吃的数据");
+    assert(L.treeRegions(tree).length >= 2, id + " 的树至少要有侧边栏与主体");
+  }
 });
 
 console.log("");

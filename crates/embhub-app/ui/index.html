@@ -53,6 +53,16 @@
     .splitter-cols { cursor: col-resize; }
     .splitter-rows { cursor: row-resize; }
     body.dragging { user-select: none; }
+    /* H2：功能区侧边栏（布局树里的常驻区域，不是浮层） */
+    .fn-nav { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+    .fn-item { text-align: left; width: 100%; }
+    .fn-item.active {
+      background: #2b4a7d; border-color: #3d63a3; color: #eaf1ff; font-weight: 600;
+    }
+    .fn-layout { display: flex; flex-wrap: wrap; gap: 6px; }
+    /* H2：占位功能（SSH/Git）的说明 —— 只有文字，没有任何控件 */
+    .placeholder-title { font-size: 13px; color: #d8c07a; margin-bottom: 6px; }
+    .placeholder > .dim { margin-bottom: 4px; }
     /* 区域：强制裁剪 + 尺寸不随内容变化 */
     .region {
       display: flex; flex-direction: column;
@@ -370,24 +380,31 @@
 
     const STORAGE_KEY = "embhub.layout.v1";
 
-    // ---- 持久化：localStorage 里的东西不可信，一律过 normalizeState（坏数据回退默认） ----
-    function loadState() {
+    // ---- 持久化（H2：**按功能分别记住**）----
+    // 仍然用同一个 key：旧数据是扁平的 `{visible, ratios, sizes}`，
+    // `normalizeWorkspace` 会把它当成「串口助手」的布局读回来（向后兼容，不崩、不产生非法布局）。
+    function loadWorkspace() {
       let raw = null;
       try { raw = localStorage.getItem(STORAGE_KEY); } catch (e) { raw = null; }
-      return normalizeState(raw);
+      return L.normalizeWorkspace(raw);
     }
+    let workspace = loadWorkspace();
+    /** 当前功能的**扁平**布局状态（既有代码照旧用 state.visible/state.ratios/state.sizes）。 */
+    let state = workspace.functions[workspace.current];
     function saveState() {
-      try { localStorage.setItem(STORAGE_KEY, serializeState(state)); } catch (e) { /* 存不了不影响布局 */ }
+      workspace.functions[workspace.current] = state; // 先把当前功能的布局存回工作区
+      try { localStorage.setItem(STORAGE_KEY, L.serializeWorkspace(workspace)); } catch (e) { /* 存不了不影响布局 */ }
     }
-    let state = loadState();
 
     // =====================================================================
     // 1. 区域注册表 → DOM：**容器由注册表创建**；内容只能通过 regions.get(id) 写
     // =====================================================================
     const appEl = document.getElementById("app");
     // 控件取值/事件一律用 document.getElementById 取一次（**内容**一律写进区域 API 给的容器）
-    const regions = new Map(); // id -> { def, el, head, body }
-    const nodes = new Map();   // 树节点 id -> DOM（区域元素或分割容器）
+    // H2 之后这三个注册表都是**当前激活视图**的（切换视图时整组换掉，见 activateFunction）。
+    let regions = new Map(); // id -> { def, el, head, body }
+    let nodes = new Map();   // 树节点 id -> DOM（区域元素或分割容器）
+    let splitterEls = new Map(); // 容器节点 id -> [分隔条元素]
 
     function createRegion(def) {
       const el = document.createElement("div");
@@ -447,42 +464,369 @@
     function adoptDeclaredContent() {
       const tpl = document.getElementById("region-sources");
       const sources = tpl ? Array.from(tpl.content.querySelectorAll("[data-region]")) : [];
+      // 声明的内容只属于**串口助手**那份视图：显式取它的注册表，
+      // 免得「启动时停在别的功能」导致控件搬错地方（那些控件就是 ui.* 引用与事件绑定的目标）。
+      const serialRegions = views.serial ? views.serial.regions : regions;
       for (const src of sources) {
-        const region = regions.get(src.dataset.region);
+        const region = serialRegions.get(src.dataset.region);
         if (!region) continue;
         while (src.firstChild) region.body.appendChild(src.firstChild);
       }
       if (tpl) tpl.remove();
     }
 
-    buildLayoutDom(TREE, appEl, true);
-    adoptDeclaredContent();
+    // =====================================================================
+    // 1.5 H2：**每个功能区一个视图**，视图之间只做「搬进/搬出 #app」，从不销毁
+    //
+    // 「切换不中断会话、不丢显示内容」就是靠这个实现的：
+    //   · 会话生命周期在后端（Rust Session），前端切换**只动渲染**；
+    //   · 切走时把该视图的 DOM 整体搬回它自己的 holder（detached）——DOM 结构、
+    //     事件监听、已经渲染出来的接收内容**原样保留**；
+    //   · 接收缓冲 chunks/retained、计数 sessionSnapshot、事件日志 logLines 本来就在 JS 里；
+    //   · 切回来只是把 DOM 搬回 #app ⇒ **既不可能是空的，也不可能重复追加**。
+    // =====================================================================
+    const views = {};        // fnId -> { id, tree, regions, nodes, splitters, holder }
+    let activeFunction = null;
 
-    // ---- 内容容器（业务内容一律写到这里，不再用 getElementById 抓内容节点） ----
-    const rxEl = document.createElement("div");
-    rxEl.id = "rx";
-    regions.get("rx").body.appendChild(rxEl);
+    /** 临时把「当前视图的三个注册表」换成指定视图的（建视图 / 挂内容时用）。 */
+    function withViewMaps(view, fn) {
+      const saved = { regions: regions, nodes: nodes, splitterEls: splitterEls };
+      regions = view.regions;
+      nodes = view.nodes;
+      splitterEls = view.splitters;
+      try {
+        return fn();
+      } finally {
+        regions = saved.regions;
+        nodes = saved.nodes;
+        splitterEls = saved.splitterEls;
+      }
+    }
 
-    const logEl = document.createElement("div");
-    logEl.id = "log";
-    regions.get("events").body.appendChild(logEl);
+    /**
+     * 按分割树建 DOM。**根节点就是容器的孩子层**（激活时根节点就是 `#app` 本身）——
+     * 不再多套一层 `.split`：多套一层就要求容器自己的模板与「唯一孩子」匹配，
+     * 那正是 RC1「静态两列模板 vs 单孩子」矛盾的来源。
+     */
+    function buildLayoutDom(node, host, isRoot) {
+      if (node.kind === "leaf") {
+        const r = createRegion(REGIONS[node.region]);
+        nodes.set(node.id, r.el);
+        host.appendChild(r.el);
+        return;
+      }
+      const box = isRoot ? host : document.createElement("div");
+      nodes.set(node.id, box);
+      box.dataset.splitNode = node.id;
+      if (!isRoot) {
+        box.className = "split split-" + node.kind;
+        host.appendChild(box);
+      }
+      for (const child of node.children) buildLayoutDom(child, box, false);
+    }
 
-    const fpHintEl = document.createElement("div");
-    fpHintEl.id = "fpHint";
-    regions.get("params").body.appendChild(fpHintEl);
+    /** 建一个功能视图（三个视图各建一次；此后切换只搬 DOM，不重建）。 */
+    function buildView(fnId) {
+      const fn = L.FUNCTIONS[fnId];
+      const holder = document.createElement("div");
+      holder.className = "view-holder";
+      holder.dataset.function = fnId;
+      const view = {
+        id: fnId,
+        tree: fn.tree,
+        holder: holder,
+        regions: new Map(),
+        nodes: new Map(),
+        splitters: new Map(),
+      };
+      withViewMaps(view, () => {
+        buildLayoutDom(fn.tree, holder, true);
+        mountSidebar(view);
+        if (fn.planned) mountPlaceholder(view);
+      });
+      views[fnId] = view;
+      return view;
+    }
 
-    const fpStatusEl = document.createElement("div");
-    fpStatusEl.id = "fpStatus";
-    regions.get("params").body.appendChild(fpStatusEl);
+    /** 把当前视图的孩子搬回它的 holder（**不销毁**），再把目标视图搬到 #app。 */
+    function activateFunction(fnId) {
+      const target = views[fnId];
+      if (!target) return false;
+      const current = activeFunction ? views[activeFunction] : null;
+      if (current && current !== target) {
+        while (appEl.firstChild) current.holder.appendChild(appEl.firstChild);
+        current.nodes.set(current.tree.id, current.holder); // 停放时根节点就是这个 holder
+      }
+      activeFunction = fnId;
+      regions = target.regions;
+      nodes = target.nodes;
+      splitterEls = target.splitters;
+      while (target.holder.firstChild) appEl.appendChild(target.holder.firstChild);
+      nodes.set(target.tree.id, appEl); // 激活时根节点就是 #app（t29 的结构不变量）
+      // 切走期间收到的批次没有画出来：切回来时**补画一次**（内容完整，且是整段重画、不会重复追加）
+      if (fnId === "serial" && batchesWhileAway > 0) {
+        batchesWhileAway = 0;
+        rerender();
+        renderLogTail();
+      }
+      applyLayout();
+      syncSidebar();
+      return true;
+    }
 
-    const sessionListEl = document.createElement("div");
-    document.getElementById("sessionList").appendChild(sessionListEl);
+    /**
+     * 切换功能区。**只动渲染，绝不碰会话**：
+     * 这里没有（也永远不许有）任何 `invoke(...)` / `close_session` / `stop_timed_send`
+     * 之类的调用 —— 会话生命周期归后端，切换不能中断采集、不能丢已接收的显示内容。
+     */
+    function switchFunction(fnId) {
+      if (!views[fnId]) return { ok: false, reason: "未知功能: " + fnId };
+      if (fnId === activeFunction) return { ok: true, changed: false, current: fnId };
+      workspace.functions[activeFunction] = state; // 当前功能的布局存回工作区
+      workspace.current = fnId;
+      state = workspace.functions[fnId]; // 载入目标功能自己的布局（各功能互不影响）
+      saveState();
+      activateFunction(fnId);
+      syncRegionToggles();
+      return { ok: true, changed: true, current: fnId };
+    }
+
+    /** 侧边栏：三个功能项（当前项高亮）+ 当前功能的区域开关/比例（按功能分别记住）。 */
+    function mountSidebar(view) {
+      const region = view.regions.get(L.SIDEBAR_ID);
+      if (!region) return;
+      const nav = document.createElement("div");
+      nav.className = "fn-nav";
+      nav.id = "fnNav";
+      for (const fnId of L.FUNCTION_ORDER) {
+        const fn = L.FUNCTIONS[fnId];
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "fn-item";
+        btn.dataset.function = fnId;
+        btn.id = "fnBtn-" + fnId; // 让 harness 的控件命中检查（control-covered）也能盯上它
+        btn.textContent = fn.label + (fn.planned ? "（占位）" : "");
+        // 点击走**真实事件处理函数**：切换功能区只换渲染，不碰会话。
+        btn.addEventListener("click", () => switchFunction(fnId));
+        nav.appendChild(btn);
+      }
+      region.body.appendChild(nav);
+      const layoutTitle = document.createElement("div");
+      layoutTitle.className = "block-title";
+      layoutTitle.textContent = "当前功能的布局";
+      region.body.appendChild(layoutTitle);
+      const box = document.createElement("div");
+      box.className = "fn-layout";
+      box.id = "fnLayout";
+      region.body.appendChild(box);
+      const hint = document.createElement("div");
+      hint.className = "dim";
+      hint.textContent = "每个功能的区域开关/比例/尺寸分开记住；切功能区不中断串口会话、不丢已接收内容。";
+      region.body.appendChild(hint);
+      view.sidebar = { nav: nav, layout: box };
+    }
+
+    /** 高亮当前功能项，并把「当前功能的区域开关/比例」渲染到侧边栏里。 */
+    function syncSidebar() {
+      const view = activeFunction ? views[activeFunction] : null;
+      if (!view || !view.sidebar) return;
+      for (const btn of Array.prototype.slice.call(view.sidebar.nav.querySelectorAll("button[data-function]"))) {
+        const on = btn.dataset.function === activeFunction;
+        btn.classList.toggle("active", on);
+        btn.setAttribute("aria-current", on ? "true" : "false");
+      }
+      view.sidebar.layout.textContent = "";
+      renderRegionControls(view.sidebar.layout, L.functionRegions(activeFunction), "fn");
+    }
+
+    /** 占位功能（SSH/Git）的内容：**只写「尚未实现」与计划范围，不放任何控件**。 */
+    function mountPlaceholder(view) {
+      const fn = L.FUNCTIONS[view.id];
+      const region = view.regions.get(fn.id);
+      if (!region) return;
+      const box = document.createElement("div");
+      box.className = "placeholder";
+      const title = document.createElement("div");
+      title.className = "placeholder-title";
+      title.textContent = fn.label + " 尚未实现";
+      const note = document.createElement("div");
+      note.className = "dim";
+      note.textContent = fn.note;
+      const scope = document.createElement("div");
+      scope.className = "dim";
+      scope.textContent = "本轮（H2）只提供入口与布局占位：本区域**没有任何控件**，"
+        + "不放点了没反应的假按钮，也不显示假状态。";
+      box.appendChild(title);
+      box.appendChild(note);
+      box.appendChild(scope);
+      region.body.appendChild(box);
+    }
+
+    // =====================================================================
+    // 1.6 **启动路径会读到的状态，必须先声明**（t33 根因修复）
+    //
+    // 用户实测的启动即崩，根因就是这一条：
+    //   `buildView("serial")` 之后**紧接着**调用 `activateFunction("serial")`，
+    //   而 activateFunction 体内要读 `batchesWhileAway`；这个 `let` 当时写在文件靠后
+    //   （第 1010 行）⇒ 顶层 init 撞上 TDZ：
+    //   `ReferenceError: Cannot access 'batchesWhileAway' before initialization`，
+    //   并且**顶层脚本从那一行起整段中断** —— adoptDeclaredContent / applyLayout / 后面
+    //   整段 init 与自检入口全都不跑，界面停在静态单格兜底上（侧边栏独占全宽、串口助手没渲染），
+    //   而它看起来还算“合理”，只有 DevTools 能发现。
+    //
+    // 规矩（t33 起）：**凡是顶层 init 会（直接或间接）读到的 let/const，一律声明在第一次
+    // 执行语句之前**。DOM 相关的东西（内容容器、`ui` 引用表）不能提前建，就先 `let = null`
+    // 占位、等串口视图挂上后再**赋值**（赋值不是声明，不会踩 TDZ）。
+    // 闸门里有一条静态断言盯着这件事（含 init 路径函数名单）。
+    // =====================================================================
+    let ui = null;            // 控件引用表（串口视图挂上、控件搬进来之后才赋值）
+    let rxEl = null;          // 接收区内容容器
+    let logEl = null;         // 事件区内容容器
+    let fpHintEl = null;      // 指纹提示
+    let fpStatusEl = null;    // 指纹状态
+    let sessionListEl = null; // 会话列表内容容器
+    let lastSolve = null;     // 最近一次求解结果
+    let running = false;      // 会话是否在跑（JS 侧真相）
+    let lastFatal = null;
+    let lastTxError = null;
+    let lastTimedNote = null;
+    const MAX_RENDER_BYTES = 256 * 1024;
+    // ---- 接收/日志/会话状态（H2：切换功能区不许丢、不许依赖 DOM）----
+    let chunks = [];          // 接收缓冲：{ t_mono, wall_ms, bytes }，切走之后继续累积
+    let retained = 0;
+    let logLines = [];        // 事件日志的近期行：{ text, cls }
+    const MAX_LOG_LINES = 500;
+    // 会话快照（JS 侧真相）：refreshStats 每 500ms 刷新一次；切换功能区**不碰它**，
+    // 所以「切换前在跑 → 切换后仍在跑」是可断言的（harness 的 session-dropped 规则）。
+    const sessionSnapshot = { running: false, session_id: null, rx: 0, tx: 0, drop: 0 };
+    let batchesWhileAway = 0; // 视图不在串口助手时收到的批次数（切回去要补画）
+    let streamDecoder = new TextDecoder("utf-8", { fatal: false });
+    // ---- 分隔条拖拽 ----
+    // 指针事件优先（Chromium 都有），拿不到就退回鼠标事件 —— harness 用同一套事件驱动。
+    const DRAG = (typeof PointerEvent !== "undefined")
+      ? { down: "pointerdown", move: "pointermove", up: "pointerup", cancel: "pointercancel", isPointer: true }
+      : { down: "mousedown", move: "mousemove", up: "mouseup", cancel: "mouseleave", isPointer: false };
+    let dragging = null;
+    // ---- 启动异常上报（RC3：启动失败必须看得见，不能只进 console）----
+    const initErrors = [];
+    /** 把启动期的异常**可见地**报出来（红条 + 原文），并留一份给自检。 */
+    function reportInitError(where, err) {
+      const detail = err && err.stack ? err.stack : String(err);
+      initErrors.push("[" + where + "] " + detail);
+      try {
+        let bar = document.getElementById("bootError");
+        if (!bar) {
+          bar = document.createElement("div");
+          bar.id = "bootError";
+          bar.style.background = "#4a1f1f";
+          bar.style.color = "#ffd9d9";
+          bar.style.border = "1px solid #a94442";
+          bar.style.padding = "8px 10px";
+          bar.style.margin = "0 0 8px 0";
+          bar.style.font = "12px/1.5 ui-monospace, monospace";
+          bar.style.whiteSpace = "pre-wrap";
+          document.body.insertBefore(bar, document.body.firstChild);
+        }
+        bar.textContent = "⚠ 启动过程出错，界面可能不完整（请把下面原文发给开发者；"
+          + "按 F9 或加 ?selftest=1 仍可跑布局自检）\n" + initErrors.join("\n\n");
+      } catch (e2) { /* 连报错都失败就只能靠 console 了 */ }
+      if (typeof console !== "undefined" && console.error) console.error("启动失败 " + where, err);
+      return { ok: false, where: where, error: detail };
+    }
+    /** 顶层 init 的每一步都过这里：单步失败不静默、也不互相带崩。 */
+    function bootStep(name, fn) {
+      try {
+        return fn();
+      } catch (e) {
+        reportInitError(name, e);
+        return null;
+      }
+    }
+    /**
+     * **布局坏了也要能跑自检**（RC4）：入口在这里就注册好，**不依赖 init 尾部**。
+     * 上一轮事故里最要命的就是这点：init 中途抛异常 ⇒ 尾部的 `?selftest=1` 入口永远进不去，
+     * 恰恰在最需要自检的时候用不了。
+     */
+    function openSelftest(reason) {
+      if (typeof runSelftest !== "function") {
+        reportInitError("自检入口(" + reason + ")", new Error("runSelftest 未定义"));
+        return;
+      }
+      try {
+        Promise.resolve(runSelftest()).then((r) => {
+          if (r && r.verdict) console.log("布局自检：" + r.verdict);
+        }).catch((e) => reportInitError("自检(" + reason + ")", e));
+      } catch (e) {
+        reportInitError("自检(" + reason + ")", e);
+      }
+    }
+    // 入口1：F9（任何时候都能按，包括 init 中途崩掉之后）
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "F9") {
+        e.preventDefault();
+        openSelftest("F9");
+      }
+    });
+    // 入口2：URL 参数 ?selftest=1 —— 挂在 load 上，**不等 init 尾部**
+    if (new URLSearchParams(window.location.search).get("selftest") === "1") {
+      window.addEventListener("load", () => openSelftest("?selftest=1"));
+    }
+    // ---- 启动路径会用到的小工具（同样声明在最前）----
+    const viewMode = () => {
+      const el = document.querySelector('input[name="view"]:checked');
+      return el ? el.value : "text";
+    };
+    const showTimestamps = () => !!(ui && ui.showTs ? ui.showTs.checked : false);
+    const hexOf = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
+    function hexToBytes(hex) {
+      const out = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+      return out;
+    }
+    /** 墙上时钟（epoch 毫秒，后端按会话创建点精确换算）→ 本地时间 HH:MM:SS.mmm。 */
+    function fmtWall(ms) {
+      const d = new Date(ms);
+      const p = (n, w) => String(n).padStart(w == null ? 2 : w, "0");
+      return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()) + "." + p(d.getMilliseconds(), 3);
+    }
+
+    // ---- t33：启动序列的每一步都走 bootStep（出错可见 + 不互相带崩）----
+    bootStep("buildView.serial", () => buildView("serial"));
+    bootStep("buildView.ssh", () => buildView("ssh"));
+    bootStep("buildView.git", () => buildView("git"));
+    // 先把串口助手挂上去：HTML 里声明的控件要搬进它的容器，`ui.*` 与事件绑定也都指向它们。
+    // （启动时究竟停在哪个功能是最后再切的 —— 见第 8 节末尾。）
+    bootStep("activateFunction.serial", () => activateFunction("serial"));
+    bootStep("adoptDeclaredContent", () => adoptDeclaredContent());
+
+    // ---- 内容容器（业务内容一律写到这里，不再用 getElementById 抓内容节点）----
+    // 注意：这里一律是**赋值**（声明在第 1.6 节）——DOM 相关的东西不能提前建，但必须提前声明。
+    bootStep("mountContent", () => {
+      if (!views.serial) return;
+      rxEl = document.createElement("div");
+      rxEl.id = "rx";
+      views.serial.regions.get("rx").body.appendChild(rxEl);
+
+      logEl = document.createElement("div");
+      logEl.id = "log";
+      views.serial.regions.get("events").body.appendChild(logEl);
+
+      fpHintEl = document.createElement("div");
+      fpHintEl.id = "fpHint";
+      views.serial.regions.get("params").body.appendChild(fpHintEl);
+
+      fpStatusEl = document.createElement("div");
+      fpStatusEl.id = "fpStatus";
+      views.serial.regions.get("params").body.appendChild(fpStatusEl);
+
+      sessionListEl = document.createElement("div");
+      const host = document.getElementById("sessionList");
+      if (host) host.appendChild(sessionListEl);
+    });
 
     // =====================================================================
     // 2. 应用尺寸：求解 → 写显式 Grid 轨道（含分隔条轨道）+ #app 的最小尺寸
     // =====================================================================
-    let lastSolve = null;
-    const splitterEls = new Map(); // 容器节点 id -> [分隔条元素]
 
     /** 把解出的孩子尺寸写成「孩子, 间隙, 孩子, 间隙…」的显式轨道（间隙轨道用来放分隔条）。 */
     function trackCss(track) {
@@ -494,8 +838,19 @@
       return parts.join(" ");
     }
 
+    /** 当前激活视图的树（**唯一的树来源**：切到 SSH/Git 后求解的必须是那一棵）。 */
+    function activeView() {
+      return activeFunction ? views[activeFunction] : null;
+    }
+
+    function activeTree() {
+      const view = activeView();
+      return view ? view.tree : TREE;
+    }
+
     function solveNow() {
       return L.solve({
+        tree: activeTree(),
         size: { width: appEl.clientWidth, height: appEl.clientHeight },
         visible: state.visible,
         ratios: state.ratios,
@@ -540,8 +895,9 @@
     }
 
     function applyLayout() {
+      const tree = activeTree(); // 只解当前功能视图的那棵树（切到 SSH/Git 就解它自己的）
       let size = { width: appEl.clientWidth, height: appEl.clientHeight };
-      let res = solve({ size: size, visible: state.visible, ratios: state.ratios, sizes: state.sizes });
+      let res = solve({ tree: tree, size: size, visible: state.visible, ratios: state.ratios, sizes: state.sizes });
       // 尺寸与最小尺寸互相影响（设了 min-* 会改变实际可用尺寸），迭代到稳定为止。
       for (let i = 0; i < 4; i += 1) {
         appEl.style.minWidth = res.minSize.width + "px";
@@ -549,7 +905,7 @@
         const next = { width: appEl.clientWidth, height: appEl.clientHeight };
         if (next.width === size.width && next.height === size.height) break;
         size = next;
-        res = solve({ size: size, visible: state.visible, ratios: state.ratios, sizes: state.sizes });
+        res = solve({ tree: tree, size: size, visible: state.visible, ratios: state.ratios, sizes: state.sizes });
       }
       for (const nodeId of Object.keys(res.tracks)) {
         const el = nodes.get(nodeId);
@@ -559,13 +915,14 @@
         if (track.kind === "cols") el.style.gridTemplateColumns = px;
         else el.style.gridTemplateRows = px;
       }
-      for (const id of REGION_ORDER) {
+      // 可见性只作用在**本视图**的区域上（别的视图的区域不在当前 DOM 里）
+      for (const id of L.functionRegions(activeFunction)) {
         const region = regions.get(id);
         if (region) region.el.hidden = !state.visible[id];
       }
       // 分隔条只在相邻的可见孩子之间出现，且轨道已按「孩子/间隙」交错 → 必须同步重建
       for (const nodeId of Object.keys(res.tracks)) {
-        rebuildSplitters(L.findNode(TREE, nodeId));
+        rebuildSplitters(L.findNode(tree, nodeId));
       }
       lastSolve = res;
       return res;
@@ -605,11 +962,7 @@
     }
 
     // ---- 分隔条拖拽（等量反向 + 双侧最小值 clamp，到极限停住）----
-    // 指针事件优先（Chromium 都有），拿不到就退回鼠标事件 —— harness 用同一套事件驱动。
-    const DRAG = (typeof PointerEvent !== "undefined")
-      ? { down: "pointerdown", move: "pointermove", up: "pointerup", cancel: "pointercancel", isPointer: true }
-      : { down: "mousedown", move: "mousemove", up: "mouseup", cancel: "mouseleave", isPointer: false };
-    let dragging = null;
+    // （DRAG / dragging 的**声明**已在第 1.6 节，启动路径会读到；这里只用到它们。）
 
     function startDrag(ev, sp, node, index) {
       if (dragging) return;
@@ -641,6 +994,7 @@
       ev.preventDefault();
       const cur = dragging.axis === "w" ? ev.clientX : ev.clientY;
       const res = L.resizePair({
+        tree: activeTree(),
         size: dragging.size,
         visible: state.visible,
         ratios: state.ratios,
@@ -671,7 +1025,7 @@
 
     /** 双击分隔条：清掉该容器孩子的钉住尺寸 → 回到出厂比例。 */
     function resetContainer(nodeId) {
-      const node = L.findNode(TREE, nodeId);
+      const node = L.findNode(activeTree(), nodeId);
       if (!node) return;
       const next = Object.assign({}, state.sizes);
       for (const kid of node.children) {
@@ -687,7 +1041,7 @@
     // =====================================================================
     // 3. 控件引用（只用于取值/事件）+ 布局控件（可见性 + 比例）
     // =====================================================================
-    const ui = {
+    ui = {
       refresh: document.getElementById("refresh"), port: document.getElementById("port"), baud: document.getElementById("baud"),
       dataBits: document.getElementById("dataBits"), parity: document.getElementById("parity"), stopBits: document.getElementById("stopBits"),
       flowControl: document.getElementById("flowControl"), open: document.getElementById("open"), close: document.getElementById("close"),
@@ -708,27 +1062,27 @@
     };
 
     /**
-     * 参数区里的「区域」块：**四个区域全部列出**（由区域表 `REGION_ORDER` 驱动，不是硬编码一组按钮）。
-     *
-     * 这就是统一的「重新打开」入口 —— 区域被关掉以后，从这里勾回来；
-     * 常驻区域（`closable: false`）的勾选框禁用并说明原因。
+     * 把一个「区域开关/比例」列表渲染进某个容器：**由传入的区域 id 列表驱动**，
+     * 不是硬编码一组按钮。`scope` 用来区分「参数区那份」和「侧边栏那份」（同一文档里可能有两份）。
      */
-    function syncRegionToggles() {
-      ui.regionToggles.textContent = "";
-      ui.layoutRatios.textContent = "";
-      for (const id of REGION_ORDER) {
+    function renderRegionControls(container, ids, scope) {
+      if (!container) return;
+      container.textContent = "";
+      for (const id of ids) {
         const def = REGIONS[id];
+        if (!def) continue;
         const label = document.createElement("label");
         const box = document.createElement("input");
         box.type = "checkbox";
         box.checked = !!state.visible[id];
         box.disabled = !def.closable;
         box.dataset.regionToggle = id; // harness 用真实 change 事件从这里「重新打开」
+        box.dataset.toggleScope = scope;
         box.title = def.closable ? "勾选/取消即可显示或关闭该区域" : (def.title + " 是常驻区域，不可关闭");
         box.addEventListener("change", () => setVisible(id, box.checked));
         label.appendChild(box);
         label.appendChild(document.createTextNode(" " + def.title + (def.closable ? "" : "（常驻）")));
-        ui.regionToggles.appendChild(label);
+        container.appendChild(label);
 
         if (def.weight > 0) {
           const ratioLabel = document.createElement("label");
@@ -738,52 +1092,78 @@
           input.max = String(L.RATIO_MAX);
           input.step = "0.25";
           input.value = String(state.ratios[id]);
+          input.dataset.ratioFor = id;
           input.style.width = "70px";
           input.addEventListener("change", () => setRatio(id, input.value));
           ratioLabel.appendChild(document.createTextNode(def.title + " 比例 "));
           ratioLabel.appendChild(input);
-          ui.layoutRatios.appendChild(ratioLabel);
+          container.appendChild(ratioLabel);
         }
       }
+    }
+
+    /**
+     * 参数区里的「区域」块：串口助手的四个区域全部列出（由区域表 `REGION_ORDER` 驱动）。
+     *
+     * 这就是统一的「重新打开」入口 —— 区域被关掉以后，从这里勾回来；
+     * 常驻区域（`closable: false`）的勾选框禁用并说明原因。
+     * 切到 SSH/Git 时参数区不在当前视图里，这份自然为空（侧边栏那份仍在）。
+     */
+    function syncRegionToggles() {
+      const serialView = views.serial;
+      const paramsRegion = serialView ? serialView.regions.get("params") : null;
+      const togglesEl = ui.regionToggles;
+      const ratiosEl = ui.layoutRatios;
+      if (!togglesEl || !ratiosEl || !paramsRegion || activeFunction !== "serial") return;
+      renderRegionControls(togglesEl, REGION_ORDER, "params");
+      renderRegionControls(ratiosEl, REGION_ORDER.filter((id) => REGIONS[id].weight > 0), "params-ratio");
+      syncSidebar();
     }
 
     // =====================================================================
     // 4. 接收区渲染（内容写进区域 API 给的容器）
     // =====================================================================
-    let running = false;
-    let lastFatal = null;
-    let lastTxError = null;
-    let lastTimedNote = null;
-    const MAX_RENDER_BYTES = 256 * 1024;
-    let chunks = []; // 每条：{ t_mono, wall_ms, bytes }
-    let retained = 0;
-    let streamDecoder = new TextDecoder("utf-8", { fatal: false });
+    // （接收缓冲 / 日志 / 会话快照 / batchesWhileAway 的**声明**已在第 1.6 节，
+    //   启动路径的 activateFunction 会读它们；这里不再重复声明。）
+
+    /** 当前视图是不是串口助手（渲染/控件都只存在于那个视图里）。 */
+    function isSerialActive() {
+      return activeFunction === "serial" && !!views.serial;
+    }
 
     function log(msg, cls) {
-      const line = document.createElement("div");
-      if (cls) line.className = cls;
       const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-      line.textContent = "[" + t + "] " + msg;
-      logEl.appendChild(line);
+      const text = "[" + t + "] " + msg;
+      logLines.push({ text: text, cls: cls || "" });
+      if (logLines.length > MAX_LOG_LINES) logLines.splice(0, logLines.length - MAX_LOG_LINES);
+      renderLogLine(logLines[logLines.length - 1]);
+    }
+
+    /** 单行渲染（日志既留在 logLines 里，也就能在任何时候重放出来 —— 不依赖 DOM 存活）。 */
+    function renderLogLine(line) {
+      if (!logEl) return;
+      const el = document.createElement("div");
+      if (line.cls) el.className = line.cls;
+      el.textContent = line.text;
+      logEl.appendChild(el);
       logEl.scrollTop = logEl.scrollHeight;
     }
 
-    const viewMode = () => document.querySelector('input[name="view"]:checked').value;
-    const showTimestamps = () => ui.showTs.checked;
-    const hexOf = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
-
-    function hexToBytes(hex) {
-      const out = new Uint8Array(hex.length / 2);
-      for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-      return out;
+    /** 用 logLines 把事件区重画一遍（切换功能回来时保证内容完整且不重复）。 */
+    function renderLogTail() {
+      if (!logEl) return;
+      logEl.textContent = "";
+      for (const line of logLines) {
+        const el = document.createElement("div");
+        if (line.cls) el.className = line.cls;
+        el.textContent = line.text;
+        logEl.appendChild(el);
+      }
+      logEl.scrollTop = logEl.scrollHeight;
     }
 
-    /** 墙上时钟（epoch 毫秒，后端按会话创建点精确换算）→ 本地时间 HH:MM:SS.mmm。 */
-    function fmtWall(ms) {
-      const d = new Date(ms);
-      const p = (n, w) => String(n).padStart(w == null ? 2 : w, "0");
-      return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()) + "." + p(d.getMilliseconds(), 3);
-    }
+    // （viewMode / showTimestamps / hexOf / hexToBytes / fmtWall 的声明都已在第 1.6 节，
+    //   启动路径会用到它们；这里不再重复声明。）
 
     function renderChunk(chunk, isFirstLine) {
       const body = viewMode() === "hex"
@@ -804,21 +1184,33 @@
       chunks.forEach((c, i) => appendText(renderChunk(c, i === 0)));
     }
 
-    /** 追加一批。文本模式且没开时间戳时走流式解码（跨批次多字节字符不会变乱码）。 */
+    /**
+     * 追加一批。文本模式且没开时间戳时走流式解码（跨批次多字节字符不会变乱码）。
+     *
+     * H2 关键：**先无条件把数据收进 JS 缓冲**（chunks/retained），再决定要不要往 DOM 画。
+     * 切到 SSH/Git 时视图不在当前 DOM 里，但缓冲照旧累积 —— 这里**不允许**丢掉任何一批，
+     * 也不允许断开订阅（订阅在启动时建立一次，切换功能区不碰它）。
+     */
     function onBatch(payload) {
       const bytes = hexToBytes(payload.hex);
       const chunk = { t_mono: payload.t_mono, wall_ms: payload.wall_ms, bytes };
       const wasEmpty = chunks.length === 0;
-      chunks.push(chunk);
+      chunks.push(chunk); // ← 先入 JS 状态（与视图是否可见无关）
       retained += bytes.length;
       while (retained > MAX_RENDER_BYTES && chunks.length > 1) {
         retained -= chunks.shift().bytes.length;
+      }
+      if (!isSerialActive()) {
+        // 视图不在串口助手：数据已经收下了，只是暂时不画；切回来时会补画（见 activateFunction）。
+        batchesWhileAway += 1;
+        return chunk;
       }
       if (showTimestamps() || viewMode() === "hex") {
         appendText(renderChunk(chunk, wasEmpty));
       } else {
         appendText(streamDecoder.decode(bytes, { stream: true }));
       }
+      return chunk;
     }
 
     // =====================================================================
@@ -1001,6 +1393,13 @@
       ui.rxBytes.textContent = s.rx_bytes;
       ui.txBytes.textContent = s.tx_bytes;
       ui.dropBytes.textContent = s.display_dropped_bytes;
+      // JS 侧的会话真相（H2）：计数与运行状态都先落在 JS 状态里，DOM 只是它的一个投影。
+      // 切功能区不碰这里，所以「切换前在跑 → 切换后仍在跑/计数不减」是可断言的。
+      sessionSnapshot.running = !!s.running;
+      sessionSnapshot.session_id = s.session_id != null ? s.session_id : null;
+      sessionSnapshot.rx = s.rx_bytes;
+      sessionSnapshot.tx = s.tx_bytes;
+      sessionSnapshot.drop = s.display_dropped_bytes;
       ui.extra.textContent = s.running
         ? s.port + " @ " + s.baud + " " + s.frame + " / 已落盘 " + s.logged_bytes + " 字节 / TX 次数 " + s.tx_writes + " / 发送失败 " + s.tx_errors
         : (s.port ? "上一次会话 " + s.port + " @ " + s.baud + " " + s.frame + "（已停止，计数为最终值）" : "");
@@ -1183,18 +1582,96 @@
     // =====================================================================
     // 7. 布局不变量 harness：?selftest=1（或点「跑布局自检」）
     //
-    //    **只测量，不改正常布局**：先把尺寸与可见性存起来，跑完原样还原。
+    //    **只测量，不改正常布局**：先把尺寸/可见性/功能区/持久化内容存起来，跑完原样还原。
     //    断言：① 任意两个可见区域不相交 ② 区域盒子不被内容撑大、内容必须被裁剪
     //         ③ 关键控件 elementFromPoint 命中自己 ④ 每区 ≥ 最小值 ⑤ 无非预期横向滚动
-    //    交互路径（t24）：拖到两个方向极限、逐区关闭再重开、尝试关常驻区域，
-    //    全部通过**真实事件处理函数**驱动，并对每个交互后的状态复用上面同一套断言。
+    //         ⑥ 轨道数 == 可见 grid item 数 ⑦ 区域没被祖先裁掉 ⑧ 区域真的画出来了
+    //    交互路径（t24）：拖到两个方向极限、逐区关闭再重开、尝试关常驻区域；
+    //    功能区切换（H2）：切到 SSH/Git、切回串口助手，并断言
+    //    **buffer-lost**（切换前后接收缓冲一字不丢、且切走期间注入的数据也在）与
+    //    **session-dropped**（切换前在跑的会话切换后仍必须在跑）。
+    //    全部通过**真实事件处理函数**驱动，并对每个状态复用上面同一套断言。
     // =====================================================================
     const SELFTEST_SIZES = [
       { w: 1600, h: 1000 }, { w: 1280, h: 800 }, { w: 1024, h: 720 },
       { w: 800, h: 600 }, { w: 640, h: 480 }, { w: 480, h: 360 },
       { w: 1600, h: 320 }, { w: 360, h: 1200 }, { w: 300, h: 240 },
     ];
-    const SELFTEST_CONTROLS = ["refresh", "port", "open", "close", "send", "clear", "showTs", "repoPath", "txInput"];
+    const SELFTEST_CONTROLS = [
+      "refresh", "port", "open", "close", "send", "clear", "showTs", "repoPath", "txInput",
+      // H2：侧边栏的三个功能项也必须真的画出来（否则切不了功能）
+      "fnBtn-serial", "fnBtn-ssh", "fnBtn-git",
+    ];
+    /** 每个功能区视图额外各测两个尺寸（「对每个功能视图跑同一套不变量」）。 */
+    const FUNCTION_SIZES = [{ w: 1024, h: 720 }, { w: 640, h: 480 }];
+
+    // ---- H2：接收缓冲/会话状态的快照（都取 JS 状态，不看 DOM）----
+    function bufferSnapshot() {
+      let bytes = 0;
+      let hash = 0;
+      for (const c of chunks) {
+        bytes += c.bytes.length;
+        for (let i = 0; i < c.bytes.length; i += 1) hash = (hash * 31 + c.bytes[i]) >>> 0;
+      }
+      return {
+        chunks: chunks.length,
+        refs: chunks.slice(), // 对象身份：用于核对「切换前那些条目一条都没丢」
+        retained: retained,
+        bytes: bytes,
+        hash: hash,
+        textLen: rxEl ? rxEl.textContent.length : 0,
+        renderedNodes: rxEl ? rxEl.childNodes.length : 0,
+      };
+    }
+
+    function describeBuffer(tag, snap) {
+      return tag + "：chunks=" + snap.chunks + " bytes=" + snap.bytes + " hash=" + snap.hash
+        + " retained=" + snap.retained + " 渲染节点=" + snap.renderedNodes + " 文本长度=" + snap.textLen;
+    }
+
+    /** 通过**真实 click 事件**点侧边栏里的功能项（不直接调 switchFunction）。 */
+    function clickFunctionButton(fnId) {
+      const view = views[activeFunction];
+      const nav = view && view.sidebar ? view.sidebar.nav : null;
+      const btn = nav ? nav.querySelector('button[data-function="' + fnId + '"]') : null;
+      if (!btn) return { ok: false, reason: "侧边栏里没有功能项 " + fnId };
+      fire(btn, "click", {});
+      return { ok: true, active: activeFunction, tree: views[activeFunction].tree.id };
+    }
+
+    /** 切走期间由 harness 注入的一批合成数据（走**真实的批次处理函数**）。 */
+    const HARNESS_INJECT_HEX = "414243"; // "ABC"
+    let harnessInjected = null;
+    let bufferBeforeSwitchAway = null;
+    let sessionBeforeSwitch = null;
+
+    /** 切走时注入一批，验证「视图不在，缓冲照旧累积」；返回注入结果（含那条 chunk 的身份）。 */
+    function injectWhileAway() {
+      const before = bufferSnapshot();
+      const injected = onBatch({ hex: HARNESS_INJECT_HEX, t_mono: 1, wall_ms: Date.now() });
+      const after = bufferSnapshot();
+      harnessInjected = injected || null;
+      return {
+        injectedBytes: HARNESS_INJECT_HEX.length / 2,
+        grew: after.bytes - before.bytes,
+        chunksGrew: after.chunks - before.chunks,
+        activeNow: activeFunction,
+      };
+    }
+
+    /** 把 harness 注入的那一条从缓冲里摘掉（自检不得改变用户看到的内容）。 */
+    function removeInjected() {
+      if (!harnessInjected) return;
+      const idx = chunks.indexOf(harnessInjected);
+      if (idx >= 0) {
+        retained -= harnessInjected.bytes.length;
+        if (retained < 0) retained = 0;
+        chunks.splice(idx, 1);
+      }
+      harnessInjected = null;
+      rerender();
+      renderLogTail();
+    }
 
     // ---- 交互驱动：全部走真实事件处理函数（不是直接改状态）----
     function fire(el, type, props) {
@@ -1290,6 +1767,82 @@
           return { params: a, rx: b, stillVisible: !!(state.visible.params && state.visible.rx) };
         },
       });
+      // 侧边栏边界在**每个功能视图**里都要能拖（它是布局树里的区域，可参与拉伸）。
+      // 形式：切到那个功能 → 拖 → 切回来（这样后续动作仍在串口视图里跑）。
+      for (const fnId of L.FUNCTION_ORDER) {
+        for (const delta of [99999, -99999]) {
+          plan.push({
+            name: "在 " + L.FUNCTIONS[fnId].label + " 视图里拖侧边栏分隔条到" + (delta > 0 ? "正向" : "负向") + "极限",
+            run: () => {
+              const back = activeFunction;
+              if (activeFunction !== fnId) clickFunctionButton(fnId);
+              const dragged = dragSplitter("shell", 0, delta);
+              if (back !== activeFunction) clickFunctionButton(back);
+              return { dragged: dragged, restoredTo: activeFunction };
+            },
+          });
+        }
+      }
+      // ---- H2：功能区切换（真实 click 事件驱动）。顺序：串口 → SSH → 串口 → Git → 串口 ----
+      for (const target of ["ssh", "serial", "git", "serial"]) {
+        const away = target !== "serial";
+        plan.push({
+          name: (away ? "切换到 " + L.FUNCTIONS[target].label : "切回串口助手")
+            + (away ? "（并验证切走期间缓冲照旧累积）" : "（并验证缓冲/会话一字不丢）"),
+          fn: target,
+          run: () => {
+            if (away) {
+              bufferBeforeSwitchAway = bufferSnapshot();
+              sessionBeforeSwitch = Object.assign({}, sessionSnapshot);
+            }
+            const clicked = clickFunctionButton(target);
+            const injected = away ? injectWhileAway() : null;
+            let bufferVerdict = null;
+            if (!away && bufferBeforeSwitchAway) {
+              const before = bufferBeforeSwitchAway;
+              const now = bufferSnapshot();
+              const injectedBytes = HARNESS_INJECT_HEX.length / 2;
+              // ① 切换前的每一条都还得在缓冲里（按对象身份核对，不是只比总数）；
+              //    只有「碰到容量上限真的裁了最旧的」才允许少。
+              const lost = before.refs.filter((c) => chunks.indexOf(c) < 0).length;
+              const capHit = retained >= MAX_RENDER_BYTES - 1;
+              // ② 顺序不许乱：还在的那些必须保持原相对顺序
+              const idxs = before.refs.map((c) => chunks.indexOf(c)).filter((i) => i >= 0);
+              const orderOk = idxs.every((v, i) => i === 0 || v > idxs[i - 1]);
+              bufferVerdict = {
+                before: { chunks: before.chunks, bytes: before.bytes, hash: before.hash, textLen: before.textLen },
+                after: { chunks: now.chunks, bytes: now.bytes, hash: now.hash, textLen: now.textLen, renderedNodes: now.renderedNodes },
+                lost: lost,
+                capHit: capHit,
+                orderOk: orderOk,
+                grewByInject: now.bytes - before.bytes,
+                injectedBytes: injectedBytes,
+                note: describeBuffer("切回后", now),
+              };
+            }
+            const sessionVerdict = (function () {
+              if (!sessionBeforeSwitch) return null;
+              const was = sessionBeforeSwitch;
+              const now = sessionSnapshot;
+              return {
+                beforeRunning: was.running,
+                afterRunning: now.running,
+                sameSession: String(was.session_id) === String(now.session_id),
+                rxNotLess: now.rx >= was.rx,
+              };
+            })();
+            const wasSerialBefore = sessionBeforeSwitch ? sessionBeforeSwitch.running : false;
+            return {
+              clicked: clicked,
+              injected: injected,
+              buffer: bufferVerdict,
+              session: sessionVerdict,
+              sessionWasRunning: wasSerialBefore,
+              active: activeFunction,
+            };
+          },
+        });
+      }
       return plan;
     }
 
@@ -1329,7 +1882,9 @@
       const skipped = [];
       const rects = {};
       const viewport = { w: window.innerWidth, h: window.innerHeight };
-      const visibleIds = REGION_ORDER.filter((id) => regions.has(id) && !regions.get(id).el.hidden);
+      // 只量**当前功能视图**里的区域（别的视图的 DOM 此刻被整块搬走了，不参与本视图的判定）
+      const activeRegions = L.functionRegions(activeFunction);
+      const visibleIds = activeRegions.filter((id) => regions.has(id) && !regions.get(id).el.hidden);
       for (const id of visibleIds) {
         const r = regions.get(id).el.getBoundingClientRect();
         rects[id] = { x: round2(r.x), y: round2(r.y), w: round2(r.width), h: round2(r.height) };
@@ -1366,6 +1921,13 @@
               + "（应有 " + expected + " 条轨道 / 项）——隐藏项没被真正移出布局，轨道与孩子错位",
           });
         }
+      }
+
+      // ①.4 **启动后自检（t33）**：根节点有 ≥2 个可见孩子，却还是单轨 ⇒ 轨道从没写进 #app
+      //      （静态兜底占着）—— 这正是「启动即崩、界面看起来还算合理」那个事故的机器判据。
+      const bootVerdict = checkTracksWritten();
+      if (!bootVerdict.ok) {
+        problems.push({ rule: "boot-degraded", detail: bootVerdict.reason });
       }
 
       // ② 区域盒子不被内容撑大；内容溢出必须被裁剪/滚动（不允许画到盒子外）
@@ -1538,6 +2100,12 @@
         state: L.normalizeState({ visible: state.visible, ratios: state.ratios, sizes: state.sizes }),
         scrollX: window.scrollX,
         scrollY: window.scrollY,
+        // H2：自检也不许改变「用户上次选的功能」与 localStorage 里的布局
+        fn: activeFunction,
+        ws: L.serializeWorkspace(workspace),
+        storage: (function () {
+          try { return localStorage.getItem(STORAGE_KEY); } catch (e) { return null; }
+        })(),
       };
       const states = [];
       const failed = [];
@@ -1588,6 +2156,24 @@
         }
       }
 
+      // ---- H2：**每个功能区视图**都要跑同一套不变量（切过去、量、再切回来）----
+      for (const fnId of L.FUNCTION_ORDER) {
+        for (const size of FUNCTION_SIZES) {
+          switchFunction(fnId);
+          appEl.style.width = size.w + "px";
+          appEl.style.height = size.h + "px";
+          const res = applyLayout();
+          const verdict = measureState();
+          const record = {
+            size: size, function: fnId, minSize: res.minSize, ok: verdict.ok,
+            rects: verdict.rects, problems: verdict.problems, skipped: verdict.skipped,
+          };
+          states.push(record);
+          if (!verdict.ok) failed.push(record);
+        }
+      }
+      switchFunction("serial");
+
       // ---- 交互路径（t24）：真实事件驱动，每个状态复用上面同一套不变量断言 ----
       let interactions = 0;
       for (const action of interactionPlan()) {
@@ -1605,6 +2191,52 @@
         const verdict = measureState();
         const extra = [];
         interactions += 1;
+        // ---- H2：切功能区的两条硬规则（按 JS 状态判定，永不跳过）----
+        if (action.fn) {
+          if (result.buffer) {
+            const b = result.buffer;
+            if (b.lost > 0 && !b.capHit) {
+              extra.push({
+                rule: "buffer-lost",
+                detail: "切回后切换前的接收缓冲丢了 " + b.lost + " 条（" + b.note + "）",
+              });
+            }
+            if (!b.orderOk) {
+              extra.push({ rule: "buffer-lost", detail: "切回后接收缓冲的条目顺序乱了（" + b.note + "）" });
+            }
+            if (b.grewByInject < b.injectedBytes) {
+              extra.push({
+                rule: "buffer-lost",
+                detail: "切走期间注入的 " + b.injectedBytes + " 字节没进缓冲（只长了 " + b.grewByInject
+                  + "）—— 视图不在就丢数据",
+              });
+            }
+            if (b.after.textLen <= 0) {
+              extra.push({ rule: "buffer-lost", detail: "切回串口助手后接收区是空的（文本长度 0）" });
+            }
+            if (b.after.renderedNodes !== b.after.chunks) {
+              extra.push({
+                rule: "buffer-lost",
+                detail: "切回后渲染节点数 " + b.after.renderedNodes + " ≠ 缓冲条目数 " + b.after.chunks
+                  + "（疑似重复追加或漏画）",
+              });
+            }
+          }
+          if (result.session && result.session.beforeRunning) {
+            if (!result.session.afterRunning) {
+              extra.push({
+                rule: "session-dropped",
+                detail: "切换功能区把正在运行的会话停掉了（切换前 running=true，切回后 false）",
+              });
+            }
+            if (!result.session.sameSession) {
+              extra.push({ rule: "session-dropped", detail: "切换功能区把会话换掉了（session_id 变了）" });
+            }
+            if (!result.session.rxNotLess) {
+              extra.push({ rule: "session-dropped", detail: "切换功能区之后 RX 计数倒退了" });
+            }
+          }
+        }
         if (action.drag) {
           // **只影响直接相邻的两个**（精确核对）：
           //  · 同一个容器里不相邻的孩子，轨道尺寸必须一字不变；
@@ -1671,11 +2303,18 @@
         if (!record.ok) failed.push(record);
       }
 
-      // 还原（自检不得改变正常布局）
-      state = saved.state;
+      // 还原（自检不得改变正常布局 / 不改用户上次选的功能 / 不改 localStorage）
+      removeInjected();
+      workspace = L.normalizeWorkspace(saved.ws); // 三个功能的布局都回到自检前
+      if (activeFunction !== workspace.current) switchFunction(workspace.current);
+      state = workspace.functions[workspace.current];
       appEl.style.width = saved.width;
       appEl.style.height = saved.height;
       applyLayout();
+      try {
+        if (saved.storage == null) localStorage.removeItem(STORAGE_KEY);
+        else localStorage.setItem(STORAGE_KEY, saved.storage);
+      } catch (e) { /* 无 localStorage（file:// 某些配置）也不影响 */ }
       window.scrollTo(saved.scrollX, saved.scrollY);
 
       // 跳过项按规则聚合（每个状态都可能跳同一条，报告里只列一次 + 出现次数 + 样例原因）
@@ -1694,6 +2333,7 @@
       const report = {
         verdict: failed.length ? "FAIL" : "PASS",
         viewport: { width: window.innerWidth, height: window.innerHeight },
+        functions: L.FUNCTION_ORDER.map((id) => ({ id: id, label: L.FUNCTIONS[id].label, regions: L.functionRegions(id) })),
         checkedStates: states.length,
         failedStates: failed.length,
         layoutStates: states.length - interactions,
@@ -1714,7 +2354,8 @@
       ui.selftestVerdict.textContent = report.verdict;
       ui.selftestVerdict.className = report.verdict === "PASS" ? "pass" : "fail";
       ui.selftestSummary.textContent = "检查了 1 个真实布局状态 + " + (report.layoutStates - 1) + " 个尺寸×可见性状态 + "
-        + report.interactions + " 个交互动作（拖到两个方向极限、逐区关闭再重开、常驻区域拒绝、双击复位），失败 "
+        + L.FUNCTION_ORDER.length + " 个功能区 × " + FUNCTION_SIZES.length + " 个尺寸 + "
+        + report.interactions + " 个交互动作（含功能区切换、拖到极限、逐区关闭再重开、常驻区域拒绝、双击复位），失败 "
         + report.failedStates + " 个；真实视口 " + report.viewport.width + "×" + report.viewport.height
         + "px；区域最小值之和 " + report.minSize.width + "×" + report.minSize.height + "px。"
         + (skippedAgg.length
@@ -1730,6 +2371,8 @@
     // =====================================================================
     // 8. 事件绑定 + 启动
     // =====================================================================
+    // 事件绑定整体过 bootStep：绑定失败只留红条，不会把后面的启动后自检/自检入口一起带崩。
+    bootStep("bindControls", () => {
     ui.refresh.addEventListener("click", refreshPorts);
     ui.open.addEventListener("click", openSession);
     ui.close.addEventListener("click", closeSession);
@@ -1776,26 +2419,97 @@
     window.addEventListener("resize", () => applyLayout());
     if (typeof ResizeObserver !== "undefined") {
       new ResizeObserver(() => applyLayout()).observe(appEl);
-    }
+    }    });
+
 
     // 显示批次：节奏由 core 的批量策略决定（≥8 KiB 或 ≥30 ms）；
     // `wall_ms` 由后端用 core 的会话起点精确换算，前端不做任何近似。
-    listen("session-batch", (event) => onBatch(event.payload)).catch((e) => {
-      log("事件订阅失败（接收区将不会有数据）：" + e, "err");
+    bootStep("listen.session-batch", () => {
+      listen("session-batch", (event) => onBatch(event.payload)).catch((e) => {
+        log("事件订阅失败（接收区将不会有数据）：" + e, "err");
+      });
     });
 
-    syncRegionToggles();
-    setRunning(false);
-    updateFpHint();
-    applyLayout();
-    refreshPorts();
-    refreshStats();
-    setInterval(refreshStats, 500);
+    // ---- 尾部 init：同样逐步过 bootStep（任何一步失败都会在页面上留红条）----
+    bootStep("syncRegionToggles", () => syncRegionToggles());
+    bootStep("setRunning", () => setRunning(false));
+    bootStep("updateFpHint", () => updateFpHint());
+    bootStep("applyLayout", () => applyLayout());
+    bootStep("refreshPorts", () => refreshPorts());
+    bootStep("refreshStats", () => refreshStats());
+    bootStep("setInterval", () => setInterval(refreshStats, 500));
 
-    // 自检入口：同一份 DOM/CSS，加 URL 参数即可（index.html?selftest=1）
-    if (new URLSearchParams(window.location.search).get("selftest") === "1") {
-      runSelftest().then((r) => console.log("布局自检：" + r.verdict));
+    // 启动时回到**上次选中的功能**（每个功能自己的布局都已经分别记住）；
+    // 放在最后是因为切换只换渲染，而上面那些 `ui.*` 引用与事件绑定必须先指向串口助手那份 DOM。
+    bootStep("restoreFunction", () => {
+      if (workspace.current && workspace.current !== activeFunction) switchFunction(workspace.current);
+    });
+
+    // =====================================================================
+    // 9. t33：启动后自检 + 自检入口必须**不依赖 init 尾部**
+    //
+    // 上一轮的事故里最要命的一点：init 在中途抛异常 ⇒ 尾部那段 `?selftest=1` 入口
+    // **永远进不去**，恰恰在最需要自检的时候用不了。所以这里：
+    //   · 启动后自检（判据 = 根节点有 ≥2 个可见孩子但 #app 计算样式仍是单轨 ⇒ 轨道从没写进去）；
+    //   · 入口三条：URL 参数（load 后触发，不依赖 init 尾部）、F9 快捷键、以及错误红条里的按钮。
+    // =====================================================================
+    /**
+     * 启动后自检：直接判「#app 到底有没有被写进轨道」。
+     *
+     * 判据：当前视图的根节点有 ≥2 个可见孩子，而 `#app` 的计算样式仍是**单轨**
+     * （即静态兜底 `100%`、求解结果从没写进去 —— 这正是 t33 事故的直接症状：
+     * 侧边栏独占全宽、串口助手没渲染）。
+     */
+    function checkTracksWritten() {
+      const view = activeView();
+      if (!view) return { ok: false, reason: "没有激活的视图" };
+      let kids = 0;
+      try {
+        const tree = L.findNode(view.tree, view.tree.id);
+        kids = L.visibleChildren(tree, state.visible, REGIONS).length;
+      } catch (e) {
+        return { ok: false, reason: "取可见孩子失败：" + e };
+      }
+      const computed = (getComputedStyle(appEl).gridTemplateColumns || "").trim();
+      const tracks = computed ? computed.split(/\s+/).length : 0;
+      if (kids >= 2 && tracks < 2) {
+        return {
+          ok: false,
+          kids: kids,
+          tracks: tracks,
+          reason: "根节点有 " + kids + " 个可见孩子，但 #app 的计算样式只有 " + tracks
+            + " 条轨道（" + computed + "）—— 说明求解结果从没写进 #app，界面停在了静态兜底上",
+        };
+      }
+      return { ok: true, kids: kids, tracks: tracks, computed: computed };
     }
+
+    /** 启动后自检：不通过就**可见地**报出来（不是只进 console）。 */
+    function runBootChecks() {
+      const verdict = checkTracksWritten();
+      if (!verdict.ok) {
+        reportInitError("启动后自检", new Error(verdict.reason));
+      } else if (initErrors.length === 0) {
+        const bar = document.getElementById("bootError");
+        if (bar) bar.remove();
+      }
+      return verdict;
+    }
+
+    // 入口3：启动后自检（并顺手把红条里也放一个「跑自检」按钮）
+    const bootCheck = bootStep("启动后自检", () => runBootChecks());
+    bootStep("自检按钮", () => {
+      const bar = document.getElementById("bootError");
+      if (!bar) return;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.id = "bootSelftest";
+      btn.textContent = "跑布局自检（F9）";
+      btn.style.marginTop = "6px";
+      btn.addEventListener("click", () => openSelftest("bootError"));
+      bar.appendChild(btn);
+    });
+    if (bootCheck && !bootCheck.ok) console.warn("启动后自检未通过：" + bootCheck.reason);
   </script>
 </body>
 

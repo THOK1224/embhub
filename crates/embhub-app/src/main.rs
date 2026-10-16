@@ -1366,11 +1366,11 @@ mod tests {
             html.contains("if (def.closable) {"),
             "区域的关闭按钮必须由区域表的 closable 字段驱动"
         );
-        // 「重新打开」的全局入口：四个区域全部由 REGION_ORDER 生成，并带可被真实事件驱动的标识
+        // 「重新打开」的全局入口：串口那份由 REGION_ORDER 生成，渲染逻辑只有一份
         assert!(
             html.contains("function syncRegionToggles()")
-                && html.contains("for (const id of REGION_ORDER)"),
-            "「区域」入口必须由区域表（REGION_ORDER）驱动"
+                && html.contains("renderRegionControls(togglesEl, REGION_ORDER, \"params\")"),
+            "「区域」入口必须由区域表（REGION_ORDER）驱动，且渲染逻辑集中在 renderRegionControls"
         );
         assert!(
             html.contains("box.dataset.regionToggle = id"),
@@ -1508,6 +1508,7 @@ mod tests {
             "paint-out",
             "track-item-mismatch",
             "h-scroll",
+            "boot-degraded",
         ] {
             assert!(
                 html.contains(&format!("rule: \"{rule}\"")),
@@ -1520,19 +1521,11 @@ mod tests {
                 "`{rule}` 是可以在本视口下判定的规则，**不允许**被标成跳过：{skipped_blocks:?}"
             );
         }
-        // 交互类规则同样不许被跳过洗白
-        for rule in ["pair-isolation", "guard-failed", "reopen-failed"] {
-            assert!(
-                html.contains(&format!("\"{rule}\"")),
-                "交互断言 `{rule}` 不见了"
-            );
-        }
-
         // ---- ⑪ RC1/RC2（t29）：#app 即根节点、命中不许接受祖先、必须测真实布局、硬名单扩容 ----
         // ① 结构上让 `#app` 自己就是根节点：轨道每次现算现写，静态 CSS 不再有与 DOM 结构不符的兜底
         assert!(
-            html.contains("buildLayoutDom(TREE, appEl, true)"),
-            "#app 必须是根节点本身（多套一层就要靠静态模板匹配「唯一孩子」，那正是 RC1 的成因）"
+            html.contains("nodes.set(target.tree.id, appEl);"),
+            "激活视图时根节点必须是 #app 本身（多套一层就要靠静态模板匹配「唯一孩子」，那正是 RC1 的成因）"
         );
         assert!(
             html.contains("const box = isRoot ? host : document.createElement(\"div\");"),
@@ -1589,11 +1582,16 @@ mod tests {
             "harness 必须有 region-covered：在「区域 ∩ 真实视口」的中心取命中，命中祖先是错误"
         );
         // ⑤ 跳过硬名单扩容：这些规则一条都不许出现在 skipped.push 块里
+        //    （t29 那条「仅断言存在」的旧块已删除 —— 这里成对断言「必须存在」+「不许被跳过」，
+        //     否则「压根不存在」会被读成通过，等于给后来人留了个后门。）
         for rule in [
             "region-clipped",
             "pair-isolation",
             "guard-failed",
             "reopen-failed",
+            "buffer-lost",
+            "session-dropped",
+            "boot-degraded",
         ] {
             assert!(
                 html.contains(&format!("\"{rule}\"")),
@@ -1606,6 +1604,324 @@ mod tests {
                 "`{rule}` 属于可判定的硬规则，**不允许**被标成跳过洗白：{skipped_blocks:?}"
             );
         }
+
+        // ---- ⑫ H2：功能区侧边栏 + 切换不丢数据 ----
+        // ① 三个功能项与各自的区域树一一对应；树只由 layout.js 提供
+        assert!(
+            html.contains("L.FUNCTION_ORDER") && html.contains("L.functionRegions(activeFunction)"),
+            "侧边栏的功能项与「当前功能的区域」必须由 layout.js 的功能表驱动"
+        );
+        assert!(
+            html.contains("const fn = L.FUNCTIONS[fnId];")
+                && html.contains("buildLayoutDom(fn.tree, holder, true)"),
+            "每个功能必须按 layout.js 给的树建视图（页面里不许再写第二套树）"
+        );
+        for fn_id in ["serial", "ssh", "git"] {
+            assert!(
+                html.contains(&format!("buildView(\"{fn_id}\")")),
+                "三个功能区视图都必须建起来：缺 {fn_id}"
+            );
+        }
+        assert!(
+            html.contains("if (fn.planned) mountPlaceholder(view);"),
+            "占位功能（SSH/Git）必须挂占位内容"
+        );
+        assert!(
+            html.contains("尚未实现") && html.contains("不放点了没反应的假按钮"),
+            "占位区域必须写明「尚未实现」与计划范围"
+        );
+        let placeholder = function_body(html, "function mountPlaceholder(view)");
+        for bad in [
+            "createElement(\"button\")",
+            "createElement(\"input\")",
+            "addEventListener",
+        ] {
+            assert!(
+                !placeholder.contains(bad),
+                "占位功能里不许放任何控件（{bad}）：{placeholder}"
+            );
+        }
+        // ② **切换路径上不许出现任何会中断会话的调用**（本轮最硬的约束）
+        let sw = function_body(html, "function switchFunction(fnId)");
+        for bad in [
+            "invoke(",
+            "close_session",
+            "stop_timed_send",
+            "clearInterval",
+            "removeEventListener",
+            "listen(",
+        ] {
+            assert!(
+                !sw.contains(bad),
+                "切换功能的处理函数里不许出现 `{bad}`（切换只准动渲染）：{sw}"
+            );
+        }
+        assert!(
+            sw.contains("activateFunction(fnId)") && sw.contains("saveState()"),
+            "切换只能走「存当前功能布局 → 换渲染 → 持久化」这条路径：{sw}"
+        );
+        // ③ 显示缓冲确实在 JS 状态里（不是只往 DOM 写）
+        assert!(
+            html.contains("let chunks = []")
+                && html.contains("let logLines = []")
+                && html.contains("const sessionSnapshot ="),
+            "接收缓冲/事件日志/会话快照必须存在 JS 状态里（不许只往 DOM 写）"
+        );
+        assert!(
+            html.contains("chunks.push(chunk); // ← 先入 JS 状态（与视图是否可见无关）"),
+            "批次必须先无条件进 JS 缓冲，再决定要不要画"
+        );
+        assert!(
+            html.contains("batchesWhileAway += 1;"),
+            "切走之后仍必须继续累积缓冲（并记住切回来要补画）"
+        );
+        assert!(
+            html.contains("rerender();\n        renderLogTail();"),
+            "切回串口助手必须补画一次（内容完整、不重复追加）"
+        );
+        // ④ 三个视图的 DOM 只搬不销毁（这就是「切回来不空、不重复」的实现方式）
+        assert!(
+            html.contains("while (appEl.firstChild) current.holder.appendChild(appEl.firstChild);"),
+            "切走时必须把视图整体搬回 holder（不销毁 ⇒ DOM/监听/已渲染内容原样保留）"
+        );
+        // ⑤ 两条新规则存在，且走 JS 状态判定（不看 DOM）
+        assert!(
+            html.contains("rule: \"buffer-lost\"") && html.contains("rule: \"session-dropped\""),
+            "harness 必须有 buffer-lost 与 session-dropped 两条规则"
+        );
+        assert!(
+            html.contains("function bufferSnapshot()") && html.contains("refs: chunks.slice()"),
+            "缓冲快照必须按对象身份记录（只比总数看不出中间丢没丢）"
+        );
+        // ⑥ 按功能分别持久化，且旧格式能安全回退
+        assert!(
+            html.contains("L.normalizeWorkspace(raw)")
+                && html.contains("L.serializeWorkspace(workspace)"),
+            "持久化必须走工作区（每个功能一份布局）"
+        );
+        assert!(
+            html.contains("workspace.functions[activeFunction] = state;")
+                && html.contains("state = workspace.functions[fnId];"),
+            "切功能必须存回旧功能的布局、载入新功能自己的布局"
+        );
+        // ⑦ **求解必须跟随当前视图的树**（切到 SSH/Git 后不许还在解串口那棵树）
+        let apply_fn = function_body(html, "function applyLayout()");
+        assert!(
+            apply_fn.contains("const tree = activeTree();")
+                && apply_fn.contains("solve({ tree: tree,"),
+            "applyLayout 必须把**当前视图**的树交给唯一的求解器：{apply_fn}"
+        );
+        assert!(
+            apply_fn.contains("L.findNode(tree, nodeId)"),
+            "重建分隔条必须按当前视图的树找容器节点"
+        );
+        assert!(
+            !html.contains("= solve({ size:"),
+            "不许再有「不带 tree」的求解调用（那样切到 SSH/Git 会解错视图）"
+        );
+        assert!(
+            html.contains("function activeTree()") && html.contains("tree: activeTree(),"),
+            "拖拽/快照/双击复位都必须通过 activeTree() 取当前视图的树"
+        );
+        assert!(
+            html.contains("for (const id of L.functionRegions(activeFunction))"),
+            "可见性只能作用在当前视图的区域上"
+        );
+        // ⑧ 侧边栏的三个功能项必须被 harness 的命中检查盯上（不能只是画在那儿点不到）
+        for fn_id in ["serial", "ssh", "git"] {
+            assert!(
+                html.contains(&format!("\"fnBtn-{fn_id}\"")),
+                "侧边栏功能项 {fn_id} 必须进入 harness 的控件命中检查清单"
+            );
+        }
+        assert!(
+            html.contains("btn.id = \"fnBtn-\" + fnId;"),
+            "功能项按钮必须有稳定 id（供命中检查与调试定位）"
+        );
+        // ⑨ 启动顺序：串口视图必须先挂上（`ui.*` 与事件绑定都指向它那份 DOM），
+        //    最后再切回「上次选中的功能」—— 否则启动时停在 SSH 会让 ui.* 全成 null。
+        let i_activate = html
+            .find("bootStep(\"activateFunction.serial\"")
+            .unwrap_or(usize::MAX);
+        let i_adopt = html.find("bootStep(\"adoptDeclaredContent\"").unwrap_or(0);
+        assert!(
+            i_activate < i_adopt,
+            "必须先 activateFunction(\"serial\") 再 adoptDeclaredContent()（否则控件搬不到串口视图里）"
+        );
+        assert!(
+            html.contains("bootStep(\"restoreFunction\"")
+                && html.contains("if (workspace.current && workspace.current !== activeFunction) switchFunction(workspace.current);"),
+            "启动末尾必须切回上次选中的功能（每个功能的布局分别记住）"
+        );
+        assert!(
+            html.contains("bootStep(\"activateFunction.serial\"")
+                && html.contains("bootStep(\"adoptDeclaredContent\""),
+            "串口视图必须先挂上再搬控件（否则 ui.* 全成 null）"
+        );
+
+        // ---- ⑬ t33：顶层 init 的 TDZ 陷阱、启动不得静默退化、自检入口必须可达 ----
+        // ① **声明必须先于执行**：init 路径函数引用到的每个顶层 let/const，
+        //    都必须在第一次顶层 init 调用之前声明（否则就是
+        //    `Cannot access 'x' before initialization` 那一类启动即崩）。
+        let (script, script_offset) = script_region(html);
+        let first_init = line_of(
+            script,
+            script.find("bootStep(\"buildView.serial\"").unwrap_or(0),
+        ) + script_offset;
+        assert!(
+            script.contains("bootStep(\"buildView.serial\""),
+            "启动序列必须走 bootStep（单步失败可见上报）"
+        );
+        let init_path_fns = [
+            "buildView",
+            "activateFunction",
+            "adoptDeclaredContent",
+            "mountSidebar",
+            "mountPlaceholder",
+            "applyLayout",
+            "syncRegionToggles",
+            "syncSidebar",
+            "rebuildSplitters",
+            "makeSplitter",
+            "solveNow",
+            "trackCss",
+            "buildLayoutDom",
+            "createRegion",
+            "renderRegionControls",
+            "setVisible",
+            "setRatio",
+            "resetContainer",
+            "log",
+            "rerender",
+            "renderLogTail",
+            "renderLogLine",
+            "appendText",
+            "onBatch",
+            "renderChunk",
+            "updateFpHint",
+            "refreshStats",
+            "setRunning",
+            "checkTracksWritten",
+        ];
+        let mut checked_decls = 0usize;
+        for fn_name in init_path_fns {
+            let body = function_body(html, &format!("function {fn_name}("));
+            for ident in identifiers(body) {
+                if let Some(decl_line) = top_level_decl_line(script, script_offset, &ident) {
+                    checked_decls += 1;
+                    assert!(
+                        decl_line < first_init,
+                        "init 路径函数 `{fn_name}` 引用了 `{ident}`，但它声明在第 {decl_line} 行、\
+                         而第一次顶层 init 调用在第 {first_init} 行 —— 这会撞 TDZ 并让顶层脚本整段中断"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked_decls > 20,
+            "init 顺序检查至少要覆盖 20 个引用，实际只有 {checked_decls}（检查本身失效了？）"
+        );
+        // 根因注释必须在（防止后来人再把声明挪到后面）
+        assert!(
+            html.contains("Cannot access 'batchesWhileAway' before initialization")
+                && html.contains("声明在第一次"),
+            "修复处必须写清 TDZ 根因（顶层 init 调用 ↔ let/const 声明顺序）"
+        );
+        // ② 启动异常必须**可见**上报（不是只进 console）
+        assert!(
+            html.contains("function reportInitError(where, err)")
+                && html.contains("function bootStep(name, fn)")
+                && html.contains("bar.id = \"bootError\"")
+                && html.contains("document.body.insertBefore(bar, document.body.firstChild)"),
+            "顶层 init 必须捕获异常并在界面上留可见红条（含错误原文）"
+        );
+        // ③ 启动后自检：根节点 ≥2 个可见孩子但 #app 仍是单轨 ⇒ 报错
+        assert!(
+            html.contains("function checkTracksWritten()")
+                && html.contains("kids >= 2 && tracks < 2")
+                && html.contains("getComputedStyle(appEl).gridTemplateColumns")
+                && html.contains("bootStep(\"启动后自检\""),
+            "必须有「根节点 ≥2 个可见孩子但 #app 仍是单轨 ⇒ 报错」的启动后自检"
+        );
+        assert!(
+            html.contains("rule: \"boot-degraded\""),
+            "同一条判据也要进 harness（rule: boot-degraded）"
+        );
+        // ④ 自检入口不由 init 尾部独占：F9 + URL(load) 都在启动序列**之前**注册
+        let f9_pos = script.find("\"F9\"").unwrap_or(usize::MAX);
+        let load_pos = script
+            .find("addEventListener(\"load\"")
+            .unwrap_or(usize::MAX);
+        let init_pos = script.find("bootStep(\"buildView.serial\"").unwrap_or(0);
+        assert!(
+            script.contains("function openSelftest(reason)"),
+            "必须有一个不依赖 init 尾部的自检入口函数"
+        );
+        assert!(
+            f9_pos < init_pos && load_pos < init_pos,
+            "F9 与 ?selftest=1(load) 入口必须在第一次 init 调用之前注册（布局坏了也进得去）"
+        );
+        assert!(
+            html.contains("btn.id = \"bootSelftest\"")
+                && html.contains("openSelftest(\"bootError\")"),
+            "错误红条里也要能一键跑自检"
+        );
+    }
+
+    /// 取 <script> 内联脚本区（返回脚本文本与它在文件里起始行的偏移，用于统一行号）。
+    fn script_region(html: &str) -> (&str, usize) {
+        let start = html.find("<script>").expect("必须有内联 <script>") + "<script>".len();
+        let rest = &html[start..];
+        let end = rest.find("</script>").expect("<script> 必须闭合");
+        let offset = html[..start].matches('\n').count();
+        (&rest[..end], offset)
+    }
+
+    fn line_of(src: &str, pos: usize) -> usize {
+        src[..pos.min(src.len())].matches('\n').count() + 1
+    }
+
+    /// 从一段 JS 里取出标识符（够用即可：字母/数字/_/$）。
+    fn identifiers(src: &str) -> Vec<String> {
+        let bytes = src.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'$' {
+                let start = i;
+                while i < bytes.len() && ident(bytes[i]) {
+                    i += 1;
+                }
+                out.push(src[start..i].to_string());
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// 顶层（4 空格缩进）`let/const/var` 声明的行号。
+    fn top_level_decl_line(script: &str, offset: usize, name: &str) -> Option<usize> {
+        let needle = format!("\n    let {name} ");
+        let needle2 = format!("\n    const {name} ");
+        let needle3 = format!("\n    let {name}=");
+        for pat in [needle, needle2, needle3] {
+            if let Some(pos) = script.find(&pat) {
+                return Some(line_of(script, pos + 1) + offset);
+            }
+        }
+        None
+    }
+
+    /// 抓出一个顶层函数的函数体（从签名到下一个「4 空格 + }」）。
+    fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("找不到函数 `{signature}`（不许删掉它）"));
+        let rest = &src[start..];
+        let end = rest.find("\n    }").map(|i| i + 6).unwrap_or(rest.len());
+        &rest[..end]
     }
 
     /// 取 CSS 里第一条「针对 `[hidden]` 且声明 `display: none`」的规则：`(选择器, 特异性, 是否 !important)`。
@@ -2277,13 +2593,19 @@ mod tests {
     #[test]
     fn ui_referenced_element_ids_are_all_defined() {
         let html = include_str!("../ui/index.html");
-        let defined: Vec<&str> = html
+        let mut defined: Vec<&str> = html
             .match_indices("id=\"")
             .map(|(i, m)| {
                 let rest = &html[i + m.len()..];
                 &rest[..rest.find('"').unwrap()]
             })
             .collect();
+        // JS 里**动态创建**的元素也算「有定义」（例如启动失败红条 #bootError、
+        // 红条上的「跑自检」按钮 #bootSelftest，以及各区域内容容器）。
+        for (i, m) in html.match_indices(".id = \"") {
+            let rest = &html[i + m.len()..];
+            defined.push(&rest[..rest.find('"').unwrap()]);
+        }
         let mut referenced: Vec<&str> = html
             .match_indices("getElementById(\"")
             .map(|(i, m)| {

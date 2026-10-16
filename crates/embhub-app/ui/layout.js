@@ -72,10 +72,45 @@
       closable: true,
       defaultVisible: true,
     },
+    // ---- H2：功能区侧边栏 + 两个占位功能（SSH / Git）----
+    // 侧边栏是**布局树里的一个区域**（不是浮层）：有自己的最小宽度、参与拉伸
+    // （weight 0 = 默认固定宽度，用户拖分隔条可以钉住别的宽度），且**不可关闭**。
+    sidebar: {
+      id: "sidebar",
+      title: "功能区",
+      minW: 150,
+      minH: 200,
+      weight: 0, // 默认固定宽度：把空间留给功能主体
+      closable: false, // 侧边栏常驻，关掉就切不了功能了
+      defaultVisible: true,
+    },
+    // 占位区域：SSH / Git 本轮**只有一个区域**，里面只写「尚未实现」与计划范围，
+    // 不放任何控件（放个点了没反应的假按钮比空着更糟）。不可关闭（否则视图会空掉）。
+    ssh: {
+      id: "ssh",
+      title: "SSH",
+      minW: 320,
+      minH: 220,
+      weight: 1,
+      closable: false,
+      defaultVisible: true,
+    },
+    git: {
+      id: "git",
+      title: "Git",
+      minW: 320,
+      minH: 220,
+      weight: 1,
+      closable: false,
+      defaultVisible: true,
+    },
   };
 
   /** 四个区域的固定顺序（界面/测试都用它，避免各处各写一遍顺序）。 */
   const REGION_ORDER = ["params", "tx", "rx", "events"];
+
+  /** 侧边栏区域 id（每个功能的树里都有它）。 */
+  const SIDEBAR_ID = "sidebar";
 
   /**
    * 分割树：左列 `params`，右列纵向 `tx / rx / events`。
@@ -103,6 +138,78 @@
 
   function isLeaf(node) {
     return node.kind === "leaf";
+  }
+
+  /**
+   * 把功能区主体包进「侧边栏 + 主体」的外壳树。
+   *
+   * 为什么这么包：`TREE`（串口助手的本体）要保持原样不动 —— 求解器测试与既有代码都按
+   * `root/left/right/row-*` 这套节点 id 工作；侧边栏作为外壳的**第一个孩子**插在最左边，
+   * 于是老节点 id 与它们的相对关系一个都不用改（只是整体少了一块侧边栏宽）。
+   */
+  function shellTree(body) {
+    return {
+      id: "shell",
+      kind: "cols",
+      gap: 8,
+      children: [
+        { id: "side", kind: "leaf", region: SIDEBAR_ID },
+        body,
+      ],
+    };
+  }
+
+  /**
+   * **每个功能自己的区域树**（只在这里定义；页面不许再写第二份，不许复制求解逻辑）。
+   * · 串口助手：侧边栏 + 现有的 params/tx/rx/events；
+   * · SSH / Git：侧边栏 + **一个**占位区域。
+   */
+  const FUNCTIONS = {
+    serial: {
+      id: "serial",
+      label: "串口助手",
+      planned: false,
+      tree: shellTree(TREE),
+    },
+    ssh: {
+      id: "ssh",
+      label: "SSH",
+      planned: true,
+      tree: shellTree({ id: "ssh-body", kind: "leaf", region: "ssh" }),
+      note: "尚未实现。计划范围：连接管理（host/port/用户/密钥）、远端命令执行与输出、"
+        + "SFTP 基础文件操作、会话日志。本轮只搭好入口与布局，不放任何假控件。",
+    },
+    git: {
+      id: "git",
+      label: "Git",
+      planned: true,
+      tree: shellTree({ id: "git-body", kind: "leaf", region: "git" }),
+      note: "尚未实现。计划范围：仓库选择与状态总览、提交历史、分支切换、"
+        + "暂存/提交/推送拉取、diff 查看。本轮只搭好入口与布局，不放任何假控件。",
+    },
+  };
+
+  /** 功能区的固定顺序（侧边栏就按这个顺序列）。 */
+  const FUNCTION_ORDER = ["serial", "ssh", "git"];
+
+  /** 某棵树里所有叶子区域 id（按树序）。树是唯一的真相，界面/测试都从这里取。 */
+  function treeRegions(tree) {
+    const out = [];
+    (function walk(node) {
+      if (!node) return;
+      if (isLeaf(node)) {
+        out.push(node.region);
+        return;
+      }
+      node.children.forEach(walk);
+    })(tree);
+    return out;
+  }
+
+  /** 某个功能视图里的区域 id 列表（含侧边栏）。 */
+  function functionRegions(fnId) {
+    const fn = FUNCTIONS[fnId];
+    return fn ? treeRegions(fn.tree) : [];
   }
 
   /** 该节点的子树里是否有可见区域。 */
@@ -473,12 +580,73 @@
     return JSON.stringify(s);
   }
 
+  // =====================================================================
+  // 工作区状态（H2：**每个功能的区域开关/比例/钉住尺寸分别记住**）
+  //
+  // 关键设计：**一个功能的布局状态，就是原来的扁平 `{visible, ratios, sizes}`**。
+  // 工作区只是在外面套一层 `functions[id]`，于是：
+  //   · 页面里 `state` 仍然等于「当前功能的扁平状态」，setVisible/setRatio/拖拽/canHide
+  //     等既有路径一行都不用改；
+  //   · 旧版本存的扁平格式可以**原样当成串口助手的布局**读回来（向后兼容）。
+  // =====================================================================
+  const WORKSPACE_VERSION = 2;
+
+  function defaultWorkspace(regions) {
+    const regs = regions || REGIONS;
+    const functions = {};
+    for (const id of FUNCTION_ORDER) functions[id] = defaultState(regs);
+    return { version: WORKSPACE_VERSION, current: FUNCTION_ORDER[0], functions: functions };
+  }
+
+  /**
+   * 工作区规整：坏 JSON / 乱结构 / 缺字段 / 旧格式，一律安全回退且不抛异常。
+   * **旧格式兼容**（此前只存单一功能的可见性/比例）：整块 `{visible, ratios, sizes}`
+   * 会被当作串口助手的布局收进 `functions.serial`，其余功能取默认。
+   */
+  function normalizeWorkspace(raw, regions) {
+    const regs = regions || REGIONS;
+    let obj = raw;
+    if (typeof raw === "string") {
+      try {
+        obj = JSON.parse(raw);
+      } catch (e) {
+        obj = null; // 坏 JSON → 全默认
+      }
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) obj = {};
+    const legacy = !obj.functions || typeof obj.functions !== "object" || Array.isArray(obj.functions);
+    const src = legacy ? null : obj.functions;
+    const functions = {};
+    for (const id of FUNCTION_ORDER) {
+      if (src && src[id] != null) {
+        functions[id] = normalizeState(src[id], regs);
+      } else if (legacy) {
+        // 旧格式描述的是「当时唯一存在的功能」= 串口助手；其它功能取默认。
+        functions[id] = id === FUNCTION_ORDER[0] ? normalizeState(obj, regs) : defaultState(regs);
+      } else {
+        functions[id] = defaultState(regs);
+      }
+    }
+    const current = FUNCTION_ORDER.indexOf(obj.current) >= 0 ? obj.current : FUNCTION_ORDER[0];
+    return { version: WORKSPACE_VERSION, current: current, functions: functions };
+  }
+
+  /** 工作区序列化（与 normalizeWorkspace 往返一致）。 */
+  function serializeWorkspace(ws, regions) {
+    return JSON.stringify(normalizeWorkspace(ws, regions));
+  }
+
   return {
     RATIO_MIN,
     RATIO_MAX,
     REGIONS,
     REGION_ORDER,
+    SIDEBAR_ID,
     TREE,
+    FUNCTIONS,
+    FUNCTION_ORDER,
+    treeRegions,
+    functionRegions,
     solve,
     resizePair,
     canHide,
@@ -494,5 +662,9 @@
     defaultState,
     normalizeState,
     serializeState,
+    WORKSPACE_VERSION,
+    defaultWorkspace,
+    normalizeWorkspace,
+    serializeWorkspace,
   };
 });

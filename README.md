@@ -3,7 +3,7 @@
 面向嵌入式开发的桌面集成工具：把**串口调试**、**SSH/SFTP**、**Git** 放进同一条工作流，
 并把每份日志与**当时运行的固件指纹**（commit + dirty + bin hash）绑定起来。
 
-> **当前状态：Phase 0 已通过；Phase 1 增量 A、B1、B2、C1、C2a、C2b、F1、F2、G1、G2 已验收。当前目标：Git 溯源（日志→commit 定位）。**
+> **当前状态：Phase 0 + 增量 A/B1/B2/C1/C2a/C2b/F1/F2/G1/G2/H1a/H1b/H2 均已验收。当前暂停点：H2（功能区侧边栏）之后。**
 > ✅ **Phase 0 全部通过**：Rust 工具链、MSVC 链接、Tauri v2 编译、WebView2 就位、窗口正常打开、**插拔串口后列表能刷新**、**115200 下能收到板子发来的真实数据**。
 > ✅ 增量 A：`ByteSource` + `LogStore` + `cli selftest`（零丢失闭环）。证据见 [`LOG.md`](LOG.md) 第 5 轮。
 > ✅ 增量 B1：`fingerprint` 固件指纹采集 + 自实现 SHA-256（bin_hash 与 Windows `Get-FileHash` 交叉校验一致）。证据见 [`LOG.md`](LOG.md) 第 7 轮。
@@ -11,8 +11,8 @@
 > ✅ 增量 C1：**流式管线与背压**（SPEC 4.3）。captain 用两项独立验证确认「显示可丢、落盘不可丢」：把显示队列容量设为 **0**（显示 100% 丢弃）时落盘仍零丢失；并用**纯 PowerShell 直接解析磁盘分片**数出 payload 536,870,912 == 源产出，**差 = 0**。证据见 [`LOG.md`](LOG.md) 第 9 轮。
 > ✅ 增量 C2a：**发送能力 `ByteSink` + `Session` 最小实现 + `cli send`/`loopback`**。`loopback --bytes 1000000` 证明「写入 == 读回 == 落盘 == 回放」。证据见 [`LOG.md`](LOG.md) 第 10 轮。
 > ✅ 增量 C2b：**GUI 串口助手面板**（打开/关闭会话、接收区文本↔HEX、发送区文本/HEX + 追加 CR/LF/CRLF、RX/TX/显示丢弃 计数）。captain 验到「能编译 + 命令/事件/元素 id 接线对称 + 适配层 8 个单测」，**交互部分无人点过**（沙箱内 WebView2 起不来），已移交为 G1–G7 用户验收项。证据见 [`LOG.md`](LOG.md) 第 11 轮。
-> ⚠️ **待你验**：`.\scripts\accept.ps1` 跑自动项（19 条）＋ [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) 第 3 节的 **G1–G10**（含**真机发送**、**串口参数真机生效**、**定时发送停止后不再发**）。
-> 全项目测试基线：**core 89 + cli 34 + app 31 = 154 passed**，另有**布局求解器 28 项**（`node crates\embhub-app\ui\layout.test.js`，纯函数、无需浏览器）；一键验收 `scripts\accept.ps1`（20 项）**20 passed / 0 failed**；`clippy -D warnings` 与 `fmt --check` 干净。
+> ⚠️ **待你验**：`.\scripts\accept.ps1` 跑自动项（**20 项**）＋ [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) 第 3 节的 **G1–G17**（含**真机发送**、**串口参数真机生效**、**定时发送停止后不再发**、**布局 harness**、**切换功能区不丢数据**）。
+> 全项目测试基线：**core 89 + cli 34 + app 31 = 154 passed**，另有**布局求解器 35 项**（`node crates\embhub-app\ui\layout.test.js`，纯函数、无需浏览器，已纳入一键验收 B7）；一键验收 `scripts\accept.ps1`（**20 项**）**20 passed / 0 failed**；`clippy -D warnings` 与 `fmt --check` 干净。布局闸门 **106 条断言**（含**「声明行 vs 首次执行行」顺序规则**，防 TDZ 这类"能全绿却启动即崩"的缺陷）。
 
 ---
 
@@ -35,10 +35,10 @@ embhub/
 ├── Cargo.toml                  # workspace：core / cli / app
 ├── crates/
 │   ├── embhub-core/            # ★ 核心层：与 UI 无关，可独立 cargo test
-│   │   └── src/lib.rs          #   串口枚举 / 读取（spike 版，Phase 1 重构为 ByteSource）
+│   │   └── src/lib.rs          #   模块注册与再导出（crc / sha256 / fingerprint / source / store / pipeline / session）
 │   ├── embhub-cli/             # 无头入口：list / read（脚本化、CI、人工验收）
 │   └── embhub-app/             # Tauri v2 桌面外壳（只做 core 的薄适配）
-│       ├── src/main.rs         #   command: list_ports / read_probe；窗口在 setup() 里建
+│       ├── src/main.rs         #   薄适配层：Tauri 命令 + 事件泵 + 布局闸门测试；窗口在 setup() 里建
 │       ├── tauri.conf.json     #   windows 置空（窗口由代码创建，以便指定 data_directory）
 │       ├── capabilities/
 │       ├── icons/icon.ico      #   由 scripts/make_icon.py 生成（tauri-build 必需）
@@ -115,6 +115,24 @@ cargo run -p embhub-app                      # 启动 spike 窗口
   取不到的字段用 `Field<T> { Value(T), Missing(String) }` 表示——**「看着有指纹、其实是空的」在类型上不成立**。
 - `embhub-core::sha256` —— 自实现的流式 SHA-256（纯 std，**零新增第三方依赖**），与 Windows `Get-FileHash` 在真实文件上逐字符一致。
 - `embhub-cli fingerprint --repo <dir> [--bin <file>]` —— 打印全部字段，缺失字段打印原因并汇总清单；采集失败仍以 0 退出（**不是命令失败**），仅缺 `--repo` 时以 1 退出。
+
+**Phase 1 增量 H2：功能区侧边栏与视图切换（已验收，真机交互待你验）**
+
+- 左侧常驻**侧边栏**（区域 `sidebar`，不可关闭、**在布局树里、可拖宽**，不是浮层）列出「**串口助手 / SSH / Git**」，当前项高亮。
+- **每个功能一棵区域树**（定义在 `ui/layout.js`，求解器仍只有一份）；**SSH / Git 目前只是诚实占位**——只写「尚未实现 + 计划范围」，**契约禁止放假控件**（闸门断言占位体内不得创建任何控件）。
+- **切换不丢数据**（本增量核心）：
+  - `switchFunction` **只做视图与状态切换**，全程不调用 `close_session`/`stop_timed_send` 等任何会中断会话的命令（闸门抓函数体逐项禁止）；
+  - **显示缓冲归 JS 状态而非 DOM**：`onBatch` **先无条件入缓冲再判视图**，切走期间事件仍在累积；
+  - 三视图 DOM **只搬不销毁**，切回时整段重画（不空、不重复）；
+  - harness 新增两条硬规则：**`buffer-lost`**（切换前后缓冲不丢/不重/顺序不乱）与 **`session-dropped`**（切换前后 running / session_id / RX 不倒退）。
+- **按功能持久化**：各功能的区域开关/比例/尺寸分别记住，重开回到上次选中的功能；**旧格式（扁平）被当作串口助手的布局安全读回**。
+
+  ```powershell
+  node crates\embhub-app\ui\layout.test.js   # 求解器（纯函数）35 项
+  # 页内 harness：?selftest=1 或 app 内「跑布局自检」按钮（67 个状态，含真实布局 + 24 个交互）
+  ```
+
+> ⚠️ **真实串口数据在切换后是否一字不少、会话是否未中断，尚未验证**（harness 的注入只覆盖 JS 缓冲路径）。请按 [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) 的 **G17** 验证。
 
 **Phase 1 增量 H1b：区域交互（已验收，像素级待你验）**
 
@@ -274,7 +292,8 @@ cargo run -p embhub-app                      # 启动 spike 窗口
 
 | 文件 | 作用 |
 | --- | --- |
-| [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | **验收清单**：15 条自动项 + 3 条人工项的原始命令、期望输出、通过标准，以及"什么情况下应推翻我的结论" |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | **会话交接**（写给下一个会话的模型，不是用户）：先读清单、任务边界、关键决策、踩坑、LOG 检索入口、开工前未决事项 |
+| [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | **验收清单**：**20 项自动项 + 17 项人工项（G1–G17）**的原始命令、期望输出、通过标准，以及"什么情况下应推翻我的结论" |
 | [`docs/SPEC.md`](docs/SPEC.md) | **应该成为什么**：设计原则、五个模块契约、边界、可执行验收标准 |
 | [`docs/PLAN.md`](docs/PLAN.md) | 实施计划 v0.3：范围、差异化、架构、八阶段、风险清单 |
 | [`docs/DECISION-2026-10-14-stack-tauri-v2.md`](docs/DECISION-2026-10-14-stack-tauri-v2.md) | 技术栈决策（为什么是 Tauri v2）与 spike 判据 |
